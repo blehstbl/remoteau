@@ -231,7 +231,74 @@ func TestHostClientLoopback(t *testing.T) {
 	stopHost()
 }
 
-// TestSessionPingRoundTrip exercises the control stream ping/pong.
+// TestMultiReceiverFanout connects two clients to one host and verifies
+// both receive media independently (Phase 11).
+func TestMultiReceiverFanout(t *testing.T) {
+	addr := "127.0.0.1:47113"
+	format := audio.Format{Rate: 48000, Channels: 2, FrameSamples: 480}
+
+	host, err := NewHost(HostOptions{
+		Name: "FANOUT-PC", Store: &memoryStore{}, Backend: &fakeBackend{format: format},
+		ListenAddr: addr, CaptureSource: audio.SourceLoopback, Format: format,
+		Logger: logging.Nop(),
+	})
+	if err != nil {
+		t.Fatalf("host: %v", err)
+	}
+	pinCh := make(chan string, 8)
+	host.opts.OnPairingCode = func(code string) { pinCh <- code }
+
+	hostCtx, stopHost := context.WithCancel(context.Background())
+	defer stopHost()
+	go func() { _ = host.Run(hostCtx) }()
+	time.Sleep(300 * time.Millisecond)
+
+	start := func(name string) (chan []byte, context.CancelFunc, chan error) {
+		ch := make(chan []byte, 64)
+		client, err := NewClient(ClientOptions{
+			HostAddr: addr, Name: name, Store: &memoryStore{},
+			PINProvider: func() (string, error) { return <-pinCh, nil },
+			OnMedia: func(pcm []byte) {
+				buf := make([]byte, len(pcm))
+				copy(buf, pcm)
+				select {
+				case ch <- buf:
+				default:
+				}
+			},
+			Logger: logging.Nop(),
+		})
+		if err != nil {
+			t.Fatalf("client %s: %v", name, err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		errCh := make(chan error, 1)
+		go func() { errCh <- client.Run(ctx) }()
+		return ch, cancel, errCh
+	}
+
+	aCh, aCancel, aErr := start("CLIENT-A")
+	bCh, bCancel, bErr := start("CLIENT-B")
+	defer aCancel()
+	defer bCancel()
+
+	got := 0
+	deadline := time.After(10 * time.Second)
+	for got < 2 {
+		select {
+		case <-aCh:
+			got++
+		case <-bCh:
+			got++
+		case err := <-aErr:
+			t.Fatalf("client A: %v", err)
+		case err := <-bErr:
+			t.Fatalf("client B: %v", err)
+		case <-deadline:
+			t.Fatalf("only %d client(s) received media", got)
+		}
+	}
+}
 func TestSessionPingRoundTrip(t *testing.T) {
 	addr := "127.0.0.1:47112"
 	hostStore := &memoryStore{}

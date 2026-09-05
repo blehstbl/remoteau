@@ -148,6 +148,10 @@ func (h *Host) Run(ctx context.Context) error {
 		}
 	}()
 
+	// Default-endpoint monitor: follow Windows default-device changes so
+	// loopback capture survives the user switching outputs (Phase 9).
+	go h.monitorDefaultEndpoint(ctx)
+
 	// Open capture lazily on first stream; a single shared capture feeds all
 	// receivers (fanout).
 	for {
@@ -217,6 +221,48 @@ func (h *Host) runDiscoveryV2(ctx context.Context, listenAddr net.Addr) error {
 		if err := conn.SetWriteDeadline(time.Now().Add(time.Second)); err == nil {
 			_, _ = conn.WriteToUDPAddrPort(announce, src)
 		}
+	}
+}
+
+// monitorDefaultEndpoint watches the default render endpoint and reopens
+// loopback capture when it changes. Polling (no COM event sink) keeps the
+// implementation cgo-free and simple; 2s latency is imperceptible.
+func (h *Host) monitorDefaultEndpoint(ctx context.Context) {
+	if h.opts.CaptureSource != audio.SourceLoopback || h.opts.DeviceSelector != "" {
+		return
+	}
+	type endpointer interface {
+		DefaultRenderEndpointID() (string, error)
+	}
+	ep, ok := h.opts.Backend.(endpointer)
+	if !ok {
+		return
+	}
+
+	last := ""
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		id, err := ep.DefaultRenderEndpointID()
+		if err != nil || id == "" {
+			continue
+		}
+		if last != "" && id != last {
+			h.mu.Lock()
+			old := h.capture
+			h.capture = nil
+			h.mu.Unlock()
+			if old != nil {
+				_ = old.Close()
+				h.log.Infof("default render endpoint changed; capture will follow the new device")
+			}
+		}
+		last = id
 	}
 }
 
