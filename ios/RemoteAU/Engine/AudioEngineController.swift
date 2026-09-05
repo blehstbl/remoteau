@@ -33,6 +33,11 @@ final class AudioEngineController {
         ring.queuedFrames / max(1.0, outputSampleRate) * 1000.0
     }
 
+    /// Current drift-correction ratio (for stats display).
+    var driftRatio: Double {
+        ring.driftRatio
+    }
+
     init(ring: PCMRing) {
         self.ring = ring
     }

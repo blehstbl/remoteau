@@ -20,6 +20,11 @@ func messageBox(title, text string) {
 	procMessageBox.Call(0, uintptr(unsafe.Pointer(textPtr)), uintptr(unsafe.Pointer(titlePtr)), 0)
 }
 
+func openLogFolder() {
+	cmd := osCommand("explorer.exe", executableDir())
+	_ = cmd.Start()
+}
+
 func executableDir() string {
 	exe, err := os.Executable()
 	if err != nil {

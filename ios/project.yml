@@ -33,8 +33,6 @@ targets:
         NSLocalNetworkUsageDescription:
           RemoteAU needs local network access to find and stream audio from
           your PC on the same Wi-Fi.
-        NSBonjourServices:
-          - _remoteau._tcp
         UIUserInterfaceStyle: Automatic
         ITSAppUsesNonExemptEncryption: false
     settings:

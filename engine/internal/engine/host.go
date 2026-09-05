@@ -321,8 +321,9 @@ type hostStream struct {
 	seq atomic.Uint32
 
 	// Per-receiver output controls.
-	volume float64 // 0..2, 1 = unity
-	muted  bool
+	volume   float64 // 0..2, 1 = unity
+	muted    bool
+	fecBias  bool
 
 	// Codec/stream bookkeeping.
 	formatGen  uint32
@@ -539,8 +540,57 @@ func (h *Host) SetQuality(minBitrate, maxBitrate int, fecBias bool) {
 	defer h.mu.Unlock()
 	for _, st := range h.conns {
 		st.quality = quality.NewController(minBitrate, maxBitrate)
-		_ = fecBias
+		st.fecBias = fecBias
 	}
+}
+
+// SetSourceDevice switches the capture source device at runtime (Phase 9 hot
+// switching). An empty selector follows the system default.
+func (h *Host) SetSourceDevice(selector string) error {
+	h.mu.Lock()
+	h.opts.DeviceSelector = selector
+	old := h.capture
+	h.capture = nil
+	h.mu.Unlock()
+	if old != nil {
+		return old.Close()
+	}
+	return nil
+}
+
+// SetCaptureSource switches between loopback and microphone capture.
+func (h *Host) SetCaptureSource(source audio.Source) error {
+	h.mu.Lock()
+	h.opts.CaptureSource = source
+	old := h.capture
+	h.capture = nil
+	h.mu.Unlock()
+	if old != nil {
+		return old.Close()
+	}
+	return nil
+}
+
+// StreamKind describes the host's running state for UIs.
+type StreamKind int
+
+const (
+	StreamStopped StreamKind = iota
+	StreamWaiting
+	StreamActive
+)
+
+// StreamState reports the host state for tray/UI surfaces.
+func (h *Host) StreamState() StreamKind {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.conns) > 0 {
+		return StreamActive
+	}
+	if h.capture != nil {
+		return StreamActive
+	}
+	return StreamWaiting
 }
 
 // offerCaps describes what the host can produce.
@@ -1024,6 +1074,12 @@ func (h *Host) applyQuality(st *hostStream, dec quality.Decision) {
 	if fs, ok := st.codec.(fecSetter); ok {
 		if err := fs.SetFEC(dec.FECEnabled, dec.ExpectedLoss); err != nil {
 			h.log.Debugf("set fec: %v", err)
+		}
+	}
+	// The Robust preset pins FEC on regardless of the adaptive decision.
+	if st.fecBias {
+		if fs, ok := st.codec.(fecSetter); ok {
+			_ = fs.SetFEC(true, 10)
 		}
 	}
 

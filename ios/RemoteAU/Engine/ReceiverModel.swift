@@ -62,6 +62,7 @@ final class ReceiverModel: ObservableObject {
     @Published var manualIPFilter: String = "" { didSet { syncIPFilter() } }
     @Published var stats = StatsSnapshot()
     @Published var discoveredPeers: [DiscoveredPeer] = []
+    @Published var finderOn = false
 
     // MARK: Engine pieces
     private let ring = PCMRing(capacityBytes: 48_000 * 4 * 2, bytesPerFrame: 4) // ~500 ms @48k stereo
@@ -164,6 +165,7 @@ final class ReceiverModel: ObservableObject {
     func startFinder() {
         guard finderRunning.value == false else { return }
         finderRunning.withLock { $0 = true }
+        DispatchQueue.main.async { [weak self] in self?.finderOn = true }
 
         let t = Thread { [weak self] in
             self?.runFinder()
@@ -179,6 +181,7 @@ final class ReceiverModel: ObservableObject {
         finderRunning.withLock { $0 = false }
         UDPSocket.closeSocket(finderFD)
         finderFD = -1
+        DispatchQueue.main.async { [weak self] in self?.finderOn = false }
     }
 
     private func runFinder() {
@@ -248,6 +251,16 @@ final class ReceiverModel: ObservableObject {
             self?.senderName = ""
             self?.senderAddress = ""
             self?.state = .waitingForSender
+        }
+    }
+
+    /// Feeds externally produced PCM (the Go v2 engine, when linked) into the
+    /// same ring/render pipeline. Non-blocking; called from Go callbacks.
+    func feedExternalPCM(_ bytes: [UInt8]) {
+        bytes.withUnsafeBufferPointer { buf in
+            if let base = buf.baseAddress {
+                ring.write(base, count: bytes.count)
+            }
         }
     }
 
@@ -532,6 +545,10 @@ final class ReceiverModel: ObservableObject {
         s.packetsSeen = reorder.value?.packetsSeen ?? 0
         s.outputRoute = audio.outputRouteName
         s.engineRunning = audio.engineRunning
+        s.codec = "pcm"
+        s.driftRatio = audio.driftRatio
+        s.maxBurstLoss = reorder.value?.maxBurstLoss ?? 0
+        s.captureFrameRateHz = reorder.value?.captureFrameRateHz ?? 0
 
         let packets = s.packetsSeen
         let deltaPackets = packets &- lastPacketsSeen

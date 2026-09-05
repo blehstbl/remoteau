@@ -72,9 +72,18 @@ final class V2Controller: ObservableObject {
         pairedPeers = RemoteAUPeerList()
     }
 
+    struct AdvancedSettings {
+        var codecOpus: Bool = false
+        var frameMs: Int = 5
+        var bitrateKbps: Int = 128
+        var fec: Bool = false
+        var dtx: Bool = false
+    }
+
     /// Starts streaming from the given host. `pinPrompt` runs on the main
     /// actor to ask the user for the pairing code.
-    func connect(host: String, name: String, pinPrompt: @escaping () async -> String) {
+    func connect(host: String, name: String, advanced: AdvancedSettings? = nil,
+                 pinPrompt: @escaping () async -> String) {
         // The Go PIN callback blocks a Go goroutine; bridge it to async Swift
         // via a continuation held until the prompt resolves.
         let holder = PINContinuation(prompt: pinPrompt)
@@ -86,7 +95,19 @@ final class V2Controller: ObservableObject {
         }
         sink = s
         RemoteAUSetMediaSink(s)
-        let err = RemoteAUConnect(host, name, pinSource)
+
+        var err: Error?
+        if let adv = advanced {
+            err = RemoteAUConnectWithCaps(
+                host, name,
+                Int32(adv.codecOpus ? 1 : 0),
+                48000, 2, Int32(adv.frameMs), Int32(adv.bitrateKbps * 1000),
+                adv.fec, adv.dtx, 5, 0,
+                pinSource
+            )
+        } else {
+            err = RemoteAUConnect(host, name, pinSource)
+        }
         if err != nil {
             lastError = err.localizedDescription
         }
@@ -99,6 +120,19 @@ final class V2Controller: ObservableObject {
     func forgetPeer(idHex: String) {
         _ = RemoteAUForgetPeer(idHex)
         pairedPeers = RemoteAUPeerList()
+    }
+
+    /// Paired PCs as decoded records (JSON keys follow the Go struct tags).
+    var peers: [PairedPC] {
+        struct Wire: Decodable {
+            var id: String?
+            var name: String?
+        }
+        guard let data = pairedPeers.data(using: .utf8),
+              let list = try? JSONDecoder().decode([Wire].self, from: data) else {
+            return []
+        }
+        return list.map { PairedPC(id: $0.id ?? "", name: $0.name ?? "PC") }
     }
 
     private func deliver(_ pcm: [UInt8]) {
@@ -117,6 +151,11 @@ final class V2Controller: ObservableObject {
             lastError = p.error ?? ""
         }
     }
+}
+
+struct PairedPC: Identifiable {
+    var id: String
+    var name: String
 }
 
 /// Blocking bridge for the PIN prompt: the Go goroutine parks until the
