@@ -105,12 +105,15 @@ enum V1Packet {
     enum DiscoveryType: UInt8 {
         case query = 1
         case announce = 2
+        case announceV2 = 3
     }
 
     struct Announce {
         var tcpPort: Int
         var instanceID: [UInt8] // 16 bytes
+        var advertised: [UInt8] // 4 bytes, announcer's IPv4 (network order)
         var name: String
+        var protoVersion: UInt8 // 0 for plain v1 announces
     }
 
     /// Encodes a discovery QUERY datagram.
@@ -126,7 +129,9 @@ enum V1Packet {
         return p
     }
 
-    /// Encodes a discovery ANNOUNCE reply.
+    /// Encodes a discovery ANNOUNCE reply (remote-au v1 wire format:
+    /// magic, version, type, port u16, nameLen u8, instance 16B,
+    /// advertised IPv4 4B, name).
     static func encodeAnnounce(announce: Announce) -> [UInt8] {
         let nameBytes = Array(announce.name.utf8.prefix(255))
         var p: [UInt8] = []
@@ -136,7 +141,21 @@ enum V1Packet {
         p.append(contentsOf: u16(UInt16(clamping: announce.tcpPort)))
         p.append(UInt8(nameBytes.count))
         p.append(contentsOf: announce.instanceID.prefix(16))
+        p.append(contentsOf: announce.advertised.prefix(4))
         p.append(contentsOf: nameBytes)
+        if announce.protoVersion != 0 {
+            // v2 marker rides in a separate datagram type (see
+            // encodeAnnounceV2); never inside the v1 packet.
+        }
+        return p
+    }
+
+    /// Encodes a v2 ANNOUNCE (type 3): identical body to v1 plus a trailing
+    /// protocol-version byte. v1 parsers reject the unknown type gracefully;
+    /// v2 finders prefer it.
+    static func encodeAnnounceV2(announce: Announce) -> [UInt8] {
+        var p = encodeAnnounce(announce: announce)
+        p.append(announce.protoVersion)
         return p
     }
 
@@ -150,18 +169,29 @@ enum V1Packet {
         guard let type = DiscoveryType(rawValue: packet[5]) else { return nil }
         let tcpPort = Int(readU16(packet, 6))
         let nameLen = Int(packet[8])
-        guard packet.count == headerLen + nameLen else { return nil }
-        let name = String(data: Data(packet[headerLen..<(headerLen + nameLen)]), encoding: .utf8) ?? ""
 
         switch type {
         case .query:
+            guard packet.count == headerLen + nameLen else { return nil }
             guard tcpPort == 0 else { return nil }
-            return (type, name, Announce(tcpPort: 0, instanceID: [], name: ""))
+            let name = String(data: Data(packet[headerLen..<(headerLen + nameLen)]), encoding: .utf8) ?? ""
+            return (type, name, Announce(tcpPort: 0, instanceID: [], advertised: [], name: "", protoVersion: 0))
         case .announce:
+            // Announce body: instance(16) + advertised(4) + name.
             let fixed = 16 + 4
-            guard packet.count >= headerLen + fixed else { return nil }
+            let wantLen = headerLen + fixed + nameLen
+            guard packet.count == wantLen || packet.count == wantLen + 1 else { return nil }
             let instance = Array(packet[headerLen..<(headerLen + 16)])
-            return (type, name, Announce(tcpPort: tcpPort, instanceID: instance, name: name))
+            let advertised = Array(packet[(headerLen + 16)..<(headerLen + 20)])
+            let nameStart = headerLen + fixed
+            let name = String(data: Data(packet[nameStart..<(nameStart + nameLen)]), encoding: .utf8) ?? ""
+            var protoVersion: UInt8 = 0
+            if packet.count == wantLen + 1 {
+                protoVersion = packet[wantLen]
+            }
+            return (type, name, Announce(tcpPort: tcpPort, instanceID: instance,
+                                         advertised: advertised, name: name,
+                                         protoVersion: protoVersion))
         }
     }
 

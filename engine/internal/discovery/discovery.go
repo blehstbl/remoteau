@@ -24,8 +24,11 @@ var magic = [4]byte{'R', 'A', 'U', 'D'}
 type MessageType uint8
 
 const (
-	TypeQuery    MessageType = 1
-	TypeAnnounce MessageType = 2
+	TypeQuery MessageType = iota + 1
+	TypeAnnounce
+	// TypeAnnounceV2 carries the same body as TypeAnnounce plus a trailing
+	// protocol-version byte. v1 parsers reject the unknown type gracefully.
+	TypeAnnounceV2
 )
 
 type InstanceID [InstanceIDLen]byte
@@ -39,6 +42,7 @@ type Announce struct {
 	InstanceID     InstanceID
 	AdvertisedAddr netip.Addr
 	Name           string
+	ProtoVersion   uint8 // 0 for plain v1 announces
 }
 
 type Message struct {
@@ -55,7 +59,27 @@ func EncodeAnnounce(a Announce) ([]byte, error) {
 	if a.TCPPort <= 0 || a.TCPPort > 65535 {
 		return nil, fmt.Errorf("announce tcp port out of range: %d", a.TCPPort)
 	}
-	return encodeAnnounce(a)
+	packet, err := encodeAnnounce(a)
+	if err != nil {
+		return nil, err
+	}
+	if a.ProtoVersion != 0 {
+		packet = append(packet, a.ProtoVersion)
+	}
+	return packet, nil
+}
+
+// EncodeAnnounceV2 encodes a type-3 announce with the protocol version byte.
+func EncodeAnnounceV2(a Announce) ([]byte, error) {
+	if a.ProtoVersion == 0 {
+		a.ProtoVersion = 2
+	}
+	packet, err := EncodeAnnounce(a)
+	if err != nil {
+		return nil, err
+	}
+	packet[5] = byte(TypeAnnounceV2)
+	return packet, nil
 }
 
 func Decode(packet []byte) (Message, error) {
@@ -74,7 +98,7 @@ func Decode(packet []byte) (Message, error) {
 
 	msgType := MessageType(packet[5])
 	switch msgType {
-	case TypeQuery, TypeAnnounce:
+	case TypeQuery, TypeAnnounce, TypeAnnounceV2:
 	default:
 		return Message{}, fmt.Errorf("unknown message type: %d", packet[5])
 	}
@@ -94,11 +118,19 @@ func Decode(packet []byte) (Message, error) {
 			Type:  msgType,
 			Query: Query{Name: string(packet[headerLen:wantLen])},
 		}, nil
-	case TypeAnnounce:
+	case TypeAnnounce, TypeAnnounceV2:
 		if len(packet) < announceNameOffset {
 			return Message{}, fmt.Errorf("announce packet too short: %d < %d", len(packet), announceNameOffset)
 		}
 		wantLen := announceNameOffset + nameLen
+		protoVersion := uint8(0)
+		if msgType == TypeAnnounceV2 {
+			wantLen++
+			if len(packet) < wantLen {
+				return Message{}, fmt.Errorf("v2 announce packet too short: %d < %d", len(packet), wantLen)
+			}
+			protoVersion = packet[wantLen-1]
+		}
 		if len(packet) != wantLen {
 			return Message{}, fmt.Errorf("invalid announce packet length: got %d, want %d", len(packet), wantLen)
 		}
@@ -115,7 +147,8 @@ func Decode(packet []byte) (Message, error) {
 				TCPPort:        tcpPort,
 				InstanceID:     instanceID,
 				AdvertisedAddr: netip.AddrFrom4(advertisedIPv4),
-				Name:           string(packet[announceNameOffset:wantLen]),
+				Name:           string(packet[announceNameOffset : announceNameOffset+nameLen]),
+				ProtoVersion:   protoVersion,
 			},
 		}, nil
 	default:

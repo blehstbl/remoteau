@@ -8,7 +8,6 @@ import (
 	"sync"
 	"time"
 
-	"remote-au/internal/audio"
 	"remote-au/internal/codec"
 	"remote-au/internal/logging"
 	"remote-au/internal/pairing"
@@ -24,6 +23,12 @@ type ClientOptions struct {
 	Name     string
 	Store    pairing.Store
 
+	// TrustedFingerprints are host certificate fingerprints (hex, SHA-256)
+	// this client will accept. When empty, any host certificate is accepted
+	// (first-pairing mode); after a successful pairing, callers should pin
+	// the host fingerprint here so later connections are authenticated.
+	TrustedFingerprints map[string]bool
+
 	// PINProvider is called when pairing is needed; the UI prompts the user
 	// to enter the code displayed on the PC.
 	PINProvider func() (string, error)
@@ -31,9 +36,16 @@ type ClientOptions struct {
 	// OnMedia delivers decoded PCM (S16LE) for playback. Must be non-blocking.
 	OnMedia func(pcm []byte)
 
+	// OnState receives state transitions ("connecting", "streaming",
+	// "reconnecting", "idle", "error: ...") for UIs.
+	OnState func(state string)
+
 	// RequestedCaps selects what the client asks for. Zero fields let the
 	// host decide.
 	RequestedCaps protocolv2.Caps
+
+	// Reconnect enables the automatic reconnect loop (Phase 9).
+	Reconnect bool
 
 	Logger logging.Logger
 
@@ -51,8 +63,39 @@ type Client struct {
 	sess   *session.Session
 	codecM sync.Mutex
 	codec  codec.Codec
+	mediaM sync.Mutex
+	media  *clientMedia
 
-	stop chan struct{}
+	// Resume state (across reconnects).
+	resumeToken [32]byte
+	lastSeq     uint32
+
+	// Ping round-trip via the control handler (single-reader discipline).
+	pingMu     sync.Mutex
+	pingNext   uint32
+	pending    map[uint32]chan uint64
+
+	// Live stats snapshot for UIs.
+	statsMu      sync.Mutex
+	stats        clientStats
+	pairedHostFp string
+
+	stop     chan struct{}
+	stopOnce sync.Once
+}
+
+type clientStats struct {
+	rttMs    float64
+	loss     float64
+	late     float64
+	jitterMs float64
+	bufMs    float64
+	seen     uint64
+	lossPk   uint64
+	latePk   uint64
+	reorder  uint64
+	conceal  uint64
+	maxBurst int
 }
 
 // NewClient creates a client.
@@ -77,10 +120,25 @@ func NewClient(opts ClientOptions) (*Client, error) {
 		opts.Name = name
 	}
 	return &Client{
-		opts: opts,
-		log:  opts.Logger,
-		stop: make(chan struct{}),
+		opts:    opts,
+		log:     opts.Logger,
+		stop:    make(chan struct{}),
+		pending: make(map[uint32]chan uint64),
 	}, nil
+}
+
+// knowsHost reports whether we already have a pairing record for the host.
+func (c *Client) knowsHost(peerID [16]byte) bool {
+	peers, err := c.opts.Store.Peers()
+	if err != nil {
+		return false
+	}
+	for _, p := range peers {
+		if p.ID == peerID {
+			return true
+		}
+	}
+	return false
 }
 
 // identity loads or creates the local identity.
@@ -102,32 +160,88 @@ func (c *Client) ensureIdentity() error {
 	return nil
 }
 
+// setState publishes a state transition to the OnState callback.
+func (c *Client) setState(s string) {
+	if c.opts.OnState != nil {
+		c.opts.OnState(s)
+	}
+}
+
 // Run connects, pairs if needed, requests the stream and receives media
-// until ctx is done.
+// until ctx is done. With Reconnect enabled it retries with exponential
+// backoff and resumes previously negotiated streams when possible.
 func (c *Client) Run(ctx context.Context) error {
 	if err := c.ensureIdentity(); err != nil {
 		return err
 	}
+	if !c.opts.Reconnect {
+		return c.runOnce(ctx)
+	}
 
+	const (
+		minDelay = 250 * time.Millisecond
+		maxDelay = 5 * time.Second
+		healthy  = 10 * time.Second
+	)
+	backoff := minDelay
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		start := time.Now()
+		err := c.runOnce(ctx)
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if errors.Is(err, pairing.ErrPinMismatch) {
+			return err // terminal: wrong code is not retryable
+		}
+		if time.Since(start) >= healthy {
+			backoff = minDelay
+		}
+		c.setState(fmt.Sprintf("reconnecting (%v)", backoff))
+		c.log.Warnf("disconnected: %v; retrying in %s", err, backoff)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-c.stop:
+			return nil
+		case <-time.After(backoff):
+		}
+		if backoff < maxDelay {
+			backoff *= 2
+			if backoff > maxDelay {
+				backoff = maxDelay
+			}
+		}
+	}
+}
+
+// runOnce performs one full connection lifecycle.
+func (c *Client) runOnce(ctx context.Context) error {
 	dialCtx, cancel := context.WithTimeout(ctx, c.opts.DialTimeout)
 	defer cancel()
 	cert, err := transportv2.DeviceCertificate(c.id)
 	if err != nil {
 		return err
 	}
-	// Pairing mode: accept any host cert for the FIRST connection; the PIN
-	// exchange authenticates it. Subsequent runs pin the fingerprint (the
-	// trust store lookup below is applied by the caller-selected verifier in
-	// a future revision; the session-layer pairing check protects us).
-	tlsCfg := transportv2.TLSConfig(cert, transportv2.FingerprintVerifier(nil, true))
+	// Trust model: pin the host when we know its fingerprint; accept any
+	// certificate only for a first (unpaired) connection — the PIN exchange
+	// then authenticates it.
+	verify := transportv2.FingerprintVerifier(c.opts.TrustedFingerprints, len(c.opts.TrustedFingerprints) == 0)
 
-	conn, err := transportv2.Dial(dialCtx, c.opts.HostAddr, tlsCfg)
+	conn, err := transportv2.Dial(dialCtx, c.opts.HostAddr, transportv2.TLSConfig(cert, verify))
 	if err != nil {
 		return err
 	}
 	c.conn = conn
 	defer func() {
 		_ = conn.Close()
+		c.conn = nil
 	}()
 	c.log.Infof("connected to %s (datagrams: %v)", c.opts.HostAddr, conn.SupportsDatagrams())
 
@@ -137,6 +251,7 @@ func (c *Client) Run(ctx context.Context) error {
 	}
 	c.sess = sess
 	defer sess.Close()
+	c.setState("connecting")
 
 	clientCaps := c.opts.RequestedCaps
 	if clientCaps.SampleRate == 0 {
@@ -148,66 +263,203 @@ func (c *Client) Run(ctx context.Context) error {
 		}
 	}
 
-	hostHello, err := sess.ExchangeHellos(ctx, c.opts.Name, clientCaps)
+	resumed, ack, err := c.tryResume(ctx, sess)
 	if err != nil {
-		return fmt.Errorf("hello: %w", err)
+		return err
 	}
-	c.log.Infof("host %q (id %x…)", hostHello.DeviceName, hostHello.DeviceID[:4])
-
-	// Pair when we have no record of this host yet.
-	if !c.knowsHost(hostHello.DeviceID) {
-		if err := c.runPairing(ctx, sess); err != nil {
-			return fmt.Errorf("pairing: %w", err)
+	var activeCaps protocolv2.Caps
+	if resumed {
+		activeCaps = ack.Active
+		c.log.Infof("resumed stream (fmtGen=%d)", ack.FormatGen)
+	} else {
+		hostHello, err := sess.ExchangeHellos(ctx, c.opts.Name, clientCaps)
+		if err != nil {
+			return fmt.Errorf("hello: %w", err)
 		}
-	}
+		c.resumeToken = sess.ResumeToken()
+		c.log.Infof("host %q (id %x…)", hostHello.DeviceName, hostHello.DeviceID[:4])
 
-	// Request the stream.
-	ack, err := sess.RequestStream(ctx, clientCaps)
-	if err != nil {
-		return fmt.Errorf("stream start: %w", err)
+		// Pair when we have no record of this host yet.
+		if !c.knowsHost(hostHello.DeviceID) {
+			if err := c.runPairing(ctx, sess); err != nil {
+				return fmt.Errorf("pairing: %w", err)
+			}
+			// Pin the host certificate from here on.
+			if fp := c.hostFingerprint(); fp != "" {
+				c.pairedHostFp = fp
+			}
+		}
+
+		ack, err = sess.RequestStream(ctx, clientCaps)
+		if err != nil {
+			return fmt.Errorf("stream start: %w", err)
+		}
+		activeCaps = ack.Active
 	}
 	c.log.Infof("stream active: %dHz %dch %dms codec=%d fmtGen=%d",
-		ack.Active.SampleRate, ack.Active.Channels, ack.Active.FrameMs, ack.Active.Codec, ack.FormatGen)
+		activeCaps.SampleRate, activeCaps.Channels, activeCaps.FrameMs, activeCaps.Codec, ack.FormatGen)
 
-	cfg := codec.Config{
-		IsOpus:     ack.Active.Codec == protocolv2.CodecOpus,
-		SampleRate: int(ack.Active.SampleRate),
-		Channels:   int(ack.Active.Channels),
-		FrameMs:    int(ack.Active.FrameMs),
-		AppID:      int(ack.Active.AppID),
-	}
-	dec, err := codec.New(cfg, c.log)
+	dec, err := codec.New(capsToCodecConfig(activeCaps), c.log)
 	if err != nil {
 		return err
 	}
 	c.setCodec(dec)
+	c.media = newClientMedia(dec, c.opts.OnMedia)
 	defer func() { _ = dec.Close() }()
+	c.setState("streaming")
 
-	// Background: stats + ping loop.
-	go c.utilityLoop(ctx)
-	// Background: media datagram receive loop.
-	mediaDone := make(chan error, 1)
-	go func() { mediaDone <- c.mediaLoop(ctx) }()
+	// Control-plane handler: pong delivery and format updates. The session
+	// has a single reader (ServeLoop); pings are matched by request ID here.
+	sess.SetHandler(c.handleControl)
 
-	ctrlErr := sess.ServeLoop(ctx)
-	mediaErr := <-mediaDone
+	// Background: media flush ticker + stats/ping loop.
+	flushStop := make(chan struct{})
+	go c.flushLoop(flushStop)
+	statsDone := make(chan struct{})
+	go func() {
+		defer close(statsDone)
+		c.utilityLoop(ctx)
+	}()
+
+	// Media receive loop (runs inline; it is the RT-heavy path).
+	mediaErr := c.mediaLoop(ctx)
+	close(flushStop)
+	<-statsDone
+
+	if ctx.Err() == nil && c.sess != nil {
+		// Graceful local stop: tell the host we're done (best effort).
+		_ = sess.SendRaw(protocolv2.Message{Type: protocolv2.MsgStreamStop})
+	}
 	if mediaErr != nil && !errors.Is(mediaErr, context.Canceled) {
 		return mediaErr
 	}
-	return ctrlErr
+	return nil
 }
 
-func (c *Client) knowsHost(peerID [16]byte) bool {
-	peers, err := c.opts.Store.Peers()
-	if err != nil {
-		return false
-	}
-	for _, p := range peers {
-		if p.ID == peerID {
-			return true
+// handleControl processes host→client control messages: pong completion and
+// format updates (codec switches).
+func (c *Client) handleControl(m protocolv2.Message) {
+	switch m.Type {
+	case protocolv2.MsgPong:
+		if len(m.Payload) >= 8 {
+			var sent uint64
+			for i := 0; i < 8; i++ {
+				sent |= uint64(m.Payload[i]) << (8 * i)
+			}
+			c.pingMu.Lock()
+			ch, ok := c.pending[m.RequestID]
+			if ok {
+				delete(c.pending, m.RequestID)
+			}
+			c.pingMu.Unlock()
+			if ok {
+				select {
+				case ch <- sent:
+				default:
+				}
+			}
 		}
+	case protocolv2.MsgFormatUpdate:
+		fu, err := protocolv2.DecodeFormatUpdate(m.Payload)
+		if err != nil {
+			return
+		}
+		dec, err := codec.New(capsToCodecConfig(fu.Caps), c.log)
+		if err != nil {
+			return
+		}
+		c.setCodec(dec)
+		c.mediaM.Lock()
+		c.media = newClientMedia(dec, c.opts.OnMedia)
+		c.mediaM.Unlock()
+		c.log.Infof("format updated: codec=%d frameMs=%d (gen %d)", fu.Caps.Codec, fu.Caps.FrameMs, fu.FormatGen)
+		_ = c.sess.SendRaw(protocolv2.Message{
+			Type:    protocolv2.MsgFormatAck,
+			Payload: protocolv2.AppendFormatAck(nil, protocolv2.FormatAck{FormatGen: fu.FormatGen, Applied: 1}),
+		})
+	default:
 	}
-	return false
+}
+
+// ping measures RTT via a request-ID matched PONG (single-reader safe).
+func (c *Client) ping(ctx context.Context) (time.Duration, error) {
+	c.pingMu.Lock()
+	c.pingNext++
+	id := c.pingNext
+	ch := make(chan uint64, 1)
+	c.pending[id] = ch
+	c.pingMu.Unlock()
+
+	defer func() {
+		c.pingMu.Lock()
+		delete(c.pending, id)
+		c.pingMu.Unlock()
+	}()
+
+	nowUs := uint64(time.Now().UnixNano() / 1000)
+	payload := make([]byte, 8)
+	for i := 0; i < 8; i++ {
+		payload[i] = byte(nowUs >> (8 * i))
+	}
+	if err := c.sess.SendRaw(protocolv2.Message{
+		Type: protocolv2.MsgPing, RequestID: id, Payload: payload,
+	}); err != nil {
+		return 0, err
+	}
+
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case sent := <-ch:
+		rtt := time.Since(time.UnixMicro(int64(sent)))
+		return rtt, nil
+	}
+}
+
+// tryResume attempts to resume a previously negotiated stream. Returns
+// (resumed, ack, err); a missed resume simply falls back to the full flow.
+// RESUME_OK payload: nextSeq(4) formatGen(4) caps(15).
+func (c *Client) tryResume(ctx context.Context, sess *session.Session) (bool, protocolv2.StreamAck, error) {
+	var zero protocolv2.StreamAck
+	if c.resumeToken == ([32]byte{}) {
+		return false, zero, nil
+	}
+	payload := make([]byte, 0, 36)
+	payload = append(payload, c.resumeToken[:]...)
+	payload = binaryAppendU32(payload, c.lastSeq)
+	if err := sess.SendRaw(protocolv2.Message{Type: protocolv2.MsgResume, Payload: payload}); err != nil {
+		return false, zero, nil // resume is best-effort
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+	defer cancel()
+	m, err := sess.RecvRaw(waitCtx)
+	if err != nil || m.Type != protocolv2.MsgResumeOK {
+		return false, zero, nil
+	}
+	if len(m.Payload) < 23 {
+		return false, zero, nil
+	}
+	nextSeq := uint32(m.Payload[0]) | uint32(m.Payload[1])<<8 | uint32(m.Payload[2])<<16 | uint32(m.Payload[3])<<24
+	formatGen := uint32(m.Payload[4]) | uint32(m.Payload[5])<<8 | uint32(m.Payload[6])<<16 | uint32(m.Payload[7])<<24
+	caps, err := protocolv2.DecodeCaps(m.Payload[8:])
+	if err != nil {
+		return false, zero, nil
+	}
+	c.lastSeq = nextSeq
+	return true, protocolv2.StreamAck{Active: caps, FormatGen: formatGen}, nil
+}
+
+func binaryAppendU32(dst []byte, v uint32) []byte {
+	return append(dst, byte(v), byte(v>>8), byte(v>>16), byte(v>>24))
+}
+
+// hostFingerprint returns the current connection's peer certificate
+// fingerprint (empty when unavailable).
+func (c *Client) hostFingerprint() string {
+	if c.conn == nil {
+		return ""
+	}
+	return PeerCertFingerprint(c.conn)
 }
 
 // runPairing drives the client side of the pairing exchange.
@@ -273,11 +525,33 @@ func (c *Client) runPairing(ctx context.Context, sess *session.Session) error {
 		ID:            peerID,
 		Name:          peerName,
 		PairingSecret: ex.Secret(),
+		Fingerprint:   c.hostFingerprint(),
 		PairedAt:      time.Now().Unix(),
 	})
 }
 
-// mediaLoop receives media datagrams, decodes and forwards to OnMedia.
+// flushLoop drives the media reorder window at frame pace.
+func (c *Client) flushLoop(stop chan struct{}) {
+	interval := 2 * time.Millisecond
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-c.stop:
+			return
+		case <-t.C:
+			c.mediaM.Lock()
+			if c.media != nil {
+				c.media.tick()
+			}
+			c.mediaM.Unlock()
+		}
+	}
+}
+
+// mediaLoop receives media datagrams into the reorder/PLC pipeline.
 func (c *Client) mediaLoop(ctx context.Context) error {
 	for {
 		if ctx.Err() != nil {
@@ -300,29 +574,18 @@ func (c *Client) mediaLoop(ctx context.Context) error {
 			c.log.Debugf("drop media: %v", err)
 			continue
 		}
-		c.decodeAndDeliver(media)
-	}
-}
-
-// decodeAndDeliver decodes one media frame. TODO(phase-3-iOS-parity): add a
-// reorder buffer + PLC here once the shared Go receiver engine is wired to
-// the mobile bindings; the iOS app currently implements this natively.
-func (c *Client) decodeAndDeliver(media protocolv2.Media) {
-	codecImpl := c.currentCodec()
-	if codecImpl == nil {
-		return
-	}
-	out := make([]byte, codecImpl.FrameBytes())
-	if media.Flags&protocolv2.FlagDTXSilence != 0 {
-		clear(out)
-	} else {
-		if _, err := codecImpl.DecodeFrame(media.Payload, false, out); err != nil {
-			c.log.Debugf("decode: %v", err)
-			return
+		c.mediaM.Lock()
+		if c.media != nil {
+			c.lastSeq = media.Seq
+			// DTX silence frames pass through as explicit concealment-free
+			// silence.
+			if media.Flags&protocolv2.FlagDTXSilence != 0 {
+				c.media.emitSilence()
+			} else {
+				c.media.accept(media.Seq, media.Flags, media.Payload)
+			}
 		}
-	}
-	if c.opts.OnMedia != nil {
-		c.opts.OnMedia(out)
+		c.mediaM.Unlock()
 	}
 }
 
@@ -338,11 +601,11 @@ func (c *Client) setCodec(dec codec.Codec) {
 	c.codecM.Unlock()
 }
 
-// utilityLoop sends stats (placeholder zeros for now) and pings.
+// utilityLoop sends real receiver statistics and measures RTT (Phase 10).
 func (c *Client) utilityLoop(ctx context.Context) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	var rtt time.Duration
+	var rttMs float64
 	for {
 		select {
 		case <-ctx.Done():
@@ -351,30 +614,81 @@ func (c *Client) utilityLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			pctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-			if r, err := c.sess.Ping(pctx); err == nil {
-				rtt = r
+			if r, err := c.ping(pctx); err == nil {
+				rttMs = float64(r.Microseconds()) / 1000.0
 			}
 			cancel()
-			stats := protocolv2.Stats{
-				RTTUs:    uint32(rtt.Microseconds()),
-				JitterUs: uint32(0),
-				LossPct:  0,
+
+			c.mediaM.Lock()
+			var m *clientMedia
+			if c.media != nil {
+				c.media.tick() // also flush held frames between 1s ticks
+				m = c.media
 			}
-			_ = c.sess.SendStats(stats)
+			c.mediaM.Unlock()
+			if m == nil {
+				continue
+			}
+			loss, late, jitterMs, bufMs, _, _, _, _, _, _ := m.snapshot()
+			c.statsMu.Lock()
+			c.stats = clientStats{
+				rttMs: rttMs, loss: loss, late: late,
+				jitterMs: jitterMs, bufMs: bufMs,
+			}
+			c.statsMu.Unlock()
+
+			_ = c.sess.SendStats(protocolv2.Stats{
+				LossPct:    uint16(clampF64(loss*100, 0, 65535)),
+				LatePct:    uint16(clampF64(late*100, 0, 65535)),
+				JitterUs:   uint32(clampF64(jitterMs*1000, 0, 4294967295)),
+				RTTUs:      uint32(clampF64(rttMs*1000, 0, 4294967295)),
+				BufDepthMs: uint16(clampF64(bufMs, 0, 65535)),
+				Underruns:  0, // underruns are receiver-render-side; surfaced by UI layers
+			})
 		}
 	}
 }
 
-// Stop terminates the client.
-func (c *Client) Stop() {
-	select {
-	case <-c.stop:
-	default:
-		close(c.stop)
+func clampF64(v, lo, hi float64) float64 {
+	if v < lo {
+		return lo
 	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+// Stats returns the latest measured stats snapshot.
+func (c *Client) Stats() clientStats {
+	c.statsMu.Lock()
+	defer c.statsMu.Unlock()
+	return c.stats
+}
+
+// Stop terminates the client (sends STREAM_STOP best-effort via the session
+// teardown).
+func (c *Client) Stop() {
+	c.stopOnce.Do(func() {
+		close(c.stop)
+	})
 	if c.sess != nil {
+		_ = c.sess.SendRaw(protocolv2.Message{Type: protocolv2.MsgStreamStop})
 		c.sess.Close()
 	}
 }
 
-var _ = audio.Format{}
+// capsToCodecConfig maps negotiated caps to a codec config.
+func capsToCodecConfig(caps protocolv2.Caps) codec.Config {
+	return codec.Config{
+		IsOpus:     caps.Codec == protocolv2.CodecOpus,
+		SampleRate: int(caps.SampleRate),
+		Channels:   int(caps.Channels),
+		FrameMs:    int(caps.FrameMs),
+		Bitrate:    int(caps.OpusBitrate),
+		FEC:        caps.FEC == 1,
+		DTX:        caps.DTX == 1,
+		Complexity: int(caps.Complexity),
+		AppID:      int(caps.AppID),
+	}
+}

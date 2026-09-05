@@ -210,8 +210,18 @@ final class ReceiverModel: ObservableObject {
         discoveryFD = fd
 
         let name = Self.deviceName()
+        var advertised: [UInt8] = [0, 0, 0, 0]
+        let ownIP = UDPSocket.primaryIPv4()
+        if ownIP != 0 {
+            withUnsafeBytes(of: ownIP) { raw in
+                for (i, b) in raw.prefix(4).enumerated() {
+                    advertised[i] = b
+                }
+            }
+        }
         let announce = V1Packet.encodeAnnounce(announce: .init(
-            tcpPort: 47000, instanceID: instanceID, name: name
+            tcpPort: 47000, instanceID: instanceID, advertised: advertised, name: name,
+            protoVersion: 0
         ))
 
         var tokens = 16

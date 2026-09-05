@@ -7,7 +7,6 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -54,6 +53,8 @@ type Session struct {
 	peerID   [16]byte
 	localID  [16]byte
 
+	localDeviceName string
+
 	// Negotiated stream parameters (host side fills on STREAM_ACK).
 	activeCaps  protocolv2.Caps
 	formatGen   uint32
@@ -95,6 +96,13 @@ func (s *Session) SetHandler(h Handler) {
 	s.mu.Unlock()
 }
 
+// SetLocalName records this device's name (included in the host's HELLO).
+func (s *Session) SetLocalName(name string) {
+	s.mu.Lock()
+	s.localDeviceName = name
+	s.mu.Unlock()
+}
+
 // PeerName returns the remote device name once known.
 func (s *Session) PeerName() string {
 	s.mu.Lock()
@@ -107,6 +115,15 @@ func (s *Session) PeerID() [16]byte {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.peerID
+}
+
+// PeerIDString returns the remote device ID as hex ("" before hello).
+func (s *Session) PeerIDString() string {
+	id := s.PeerID()
+	if id == ([16]byte{}) {
+		return ""
+	}
+	return fmt.Sprintf("%x", id)
 }
 
 // Conn exposes the underlying transport connection.
@@ -177,24 +194,21 @@ func (s *Session) recv(ctx context.Context) (protocolv2.Message, error) {
 // ExchangeHellos performs the initial HELLO/HELLO_OK handshake. offered lists
 // the formats this host can produce (RoleHost) or consume (RoleClient).
 func (s *Session) ExchangeHellos(ctx context.Context, name string, offered protocolv2.Caps) (protocolv2.Hello, error) {
-	if err := s.send(protocolv2.Message{
-		Type:    protocolv2.MsgHello,
-		Payload: protocolv2.AppendHello(nil, protocolv2.Hello{
-			ProtoVersion: protocolv2.Version,
-			MinProto:     protocolv2.Version,
-			DeviceName:   name,
-			DeviceID:     s.localID,
-			Caps:         offered,
-		}),
-	}); err != nil {
+	if err := s.SendHello(name, offered); err != nil {
 		return protocolv2.Hello{}, err
 	}
-
 	m, err := s.recv(ctx)
 	if err != nil {
 		return protocolv2.Hello{}, err
 	}
-	if m.Type != protocolv2.MsgHello && m.Type != protocolv2.MsgHelloOK {
+	if s.role == RoleHost {
+		if m.Type != protocolv2.MsgHello {
+			return protocolv2.Hello{}, fmt.Errorf("expected hello, got %04x", m.Type)
+		}
+		return s.CompleteHello(m, offered)
+	}
+	// Client role: expect the host's HELLO...
+	if m.Type != protocolv2.MsgHello {
 		return protocolv2.Hello{}, fmt.Errorf("expected hello, got %04x", m.Type)
 	}
 	peerHello, err := protocolv2.DecodeHello(m.Payload)
@@ -206,31 +220,6 @@ func (s *Session) ExchangeHellos(ctx context.Context, name string, offered proto
 	s.peerID = peerHello.DeviceID
 	s.mu.Unlock()
 
-	// Reply side: the host answers with HELLO_OK carrying the selected
-	// profile and a resume token.
-	if s.role == RoleHost {
-		selected, ok := selectProfile(offered, peerHello.Caps)
-		if !ok {
-			_ = s.send(protocolv2.Message{Type: protocolv2.MsgHelloOK})
-			return peerHello, ErrUnsupported
-		}
-		var token [32]byte
-		_, _ = rand.Read(token[:])
-		s.mu.Lock()
-		s.activeCaps = selected
-		s.resumeToken = token
-		active := s.activeCaps
-		s.mu.Unlock()
-		if err := s.send(protocolv2.Message{
-			Type:    protocolv2.MsgHelloOK,
-			Payload: protocolv2.AppendHelloOK(nil, protocolv2.HelloOK{Profile: active, ResumeToken: token}),
-		}); err != nil {
-			return peerHello, err
-		}
-		return peerHello, nil
-	}
-
-	// Client: wait for HELLO_OK.
 	okMsg, err := s.recv(ctx)
 	if err != nil {
 		return peerHello, err
@@ -247,6 +236,90 @@ func (s *Session) ExchangeHellos(ctx context.Context, name string, offered proto
 	s.resumeToken = okPayload.ResumeToken
 	s.mu.Unlock()
 	return peerHello, nil
+}
+
+// SendHello sends this side's HELLO (host sends first so the engine can
+// interleave RESUME handling).
+func (s *Session) SendHello(name string, offered protocolv2.Caps) error {
+	return s.send(protocolv2.Message{
+		Type:    protocolv2.MsgHello,
+		Payload: protocolv2.AppendHello(nil, protocolv2.Hello{
+			ProtoVersion: protocolv2.Version,
+			MinProto:     protocolv2.Version,
+			DeviceName:   name,
+			DeviceID:     s.localID,
+			Caps:         offered,
+		}),
+	})
+}
+
+// CompleteHello processes a received HELLO on the host: records the peer,
+// answers with the host's own HELLO plus HELLO_OK (selected profile and a
+// resume token).
+func (s *Session) CompleteHello(m protocolv2.Message, offered protocolv2.Caps) (protocolv2.Hello, error) {
+	if s.role != RoleHost {
+		return protocolv2.Hello{}, errors.New("only the host completes hello")
+	}
+	if m.Type != protocolv2.MsgHello {
+		return protocolv2.Hello{}, fmt.Errorf("expected hello, got %04x", m.Type)
+	}
+	peerHello, err := protocolv2.DecodeHello(m.Payload)
+	if err != nil {
+		return protocolv2.Hello{}, fmt.Errorf("decode hello: %w", err)
+	}
+	s.mu.Lock()
+	s.peerName = peerHello.DeviceName
+	s.peerID = peerHello.DeviceID
+	s.mu.Unlock()
+
+	selected, ok := selectProfile(offered, peerHello.Caps)
+	if !ok {
+		_ = s.send(protocolv2.Message{Type: protocolv2.MsgHelloOK})
+		return peerHello, ErrUnsupported
+	}
+	var token [32]byte
+	_, _ = rand.Read(token[:])
+	s.mu.Lock()
+	s.activeCaps = selected
+	s.resumeToken = token
+	active := s.activeCaps
+	s.mu.Unlock()
+
+	// Host's own HELLO (device identity), then HELLO_OK.
+	if err := s.send(protocolv2.Message{
+		Type:    protocolv2.MsgHello,
+		Payload: protocolv2.AppendHello(nil, protocolv2.Hello{
+			ProtoVersion: protocolv2.Version,
+			MinProto:     protocolv2.Version,
+			DeviceName:   s.localName(),
+			DeviceID:     s.localID,
+			Caps:         offered,
+		}),
+	}); err != nil {
+		return peerHello, err
+	}
+	if err := s.send(protocolv2.Message{
+		Type:    protocolv2.MsgHelloOK,
+		Payload: protocolv2.AppendHelloOK(nil, protocolv2.HelloOK{Profile: active, ResumeToken: token}),
+	}); err != nil {
+		return peerHello, err
+	}
+	return peerHello, nil
+}
+
+// localName returns the host device name (set via SetLocalName).
+func (s *Session) localName() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.localDeviceName
+}
+
+// ResumeToken returns the token assigned by the host (host role after
+// CompleteHello, client role after ExchangeHellos).
+func (s *Session) ResumeToken() [32]byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.resumeToken
 }
 
 // RequestStream (client) asks the host to start streaming the given format.
@@ -325,38 +398,6 @@ func (s *Session) SendVolume(v protocolv2.Volume) error {
 		Type:    protocolv2.MsgVolume,
 		Payload: append([]byte{}, byte(v.VolumeQ16&0xFF), byte(v.VolumeQ16>>8), v.Mute),
 	})
-}
-
-// Ping sends PING and waits for PONG, returning the round trip.
-func (s *Session) Ping(ctx context.Context) (time.Duration, error) {
-	var nowUs = uint64(time.Now().UnixNano() / 1000)
-	if err := s.send(protocolv2.Message{
-		Type:    protocolv2.MsgPing,
-		Payload: mustAppendPing(nowUs),
-	}); err != nil {
-		return 0, err
-	}
-	m, err := s.recv(ctx)
-	if err != nil {
-		return 0, err
-	}
-	if m.Type != protocolv2.MsgPong {
-		return 0, fmt.Errorf("expected pong, got %04x", m.Type)
-	}
-	if len(m.Payload) < 8 {
-		return 0, errors.New("pong payload malformed")
-	}
-	sent := binary.LittleEndian.Uint64(m.Payload[:8])
-	rtt := time.Since(time.UnixMicro(int64(sent)))
-	return rtt, nil
-}
-
-func mustAppendPing(nowUs uint64) []byte {
-	out := make([]byte, 8)
-	for i := 0; i < 8; i++ {
-		out[i] = byte(nowUs >> (8 * i))
-	}
-	return out
 }
 
 // ServeLoop reads messages until close, dispatching to the registered

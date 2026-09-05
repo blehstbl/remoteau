@@ -157,6 +157,31 @@ type StreamAck struct {
 	FormatGen uint32
 }
 
+func AppendFormatAck(dst []byte, f FormatAck) []byte {
+	dst = binary.LittleEndian.AppendUint32(dst, f.FormatGen)
+	return append(dst, f.Applied)
+}
+
+func DecodeFormatAck(b []byte) (FormatAck, error) {
+	if len(b) != 5 {
+		return FormatAck{}, errors.New("format-ack length mismatch")
+	}
+	return FormatAck{
+		FormatGen: binary.LittleEndian.Uint32(b[0:4]),
+		Applied:   b[4],
+	}, nil
+}
+
+// CodecName returns a human-readable codec name.
+func (c Caps) CodecName() string {
+	switch c.Codec {
+	case CodecOpus:
+		return "opus"
+	default:
+		return "pcm"
+	}
+}
+
 type FormatUpdate struct {
 	FormatGen uint32
 	Caps      Caps

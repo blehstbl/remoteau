@@ -19,6 +19,7 @@ import (
 //     (Opus PLC) and the return value is the replacement PCM.
 type Codec interface {
 	Name() string
+	Config() Config   // the configuration this codec was built with
 	FrameBytes() int  // PCM bytes per encode input
 	WireMTU() int     // max wire frame size
 	EncodeFrame(pcm []byte) ([]byte, error)
@@ -99,6 +100,7 @@ type pcmCodec struct {
 }
 
 func (p *pcmCodec) Name() string     { return "pcm" }
+func (p *pcmCodec) Config() Config   { return p.cfg }
 func (p *pcmCodec) FrameBytes() int  { return p.cfg.PCMFrameBytes() }
 func (p *pcmCodec) WireMTU() int     { return p.cfg.PCMFrameBytes() }
 

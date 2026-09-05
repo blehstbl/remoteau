@@ -100,6 +100,7 @@ func expectedLoss(cfg Config) int {
 }
 
 func (o *opusCodec) Name() string    { return "opus" }
+func (o *opusCodec) Config() Config  { return o.cfg }
 func (o *opusCodec) FrameBytes() int { return o.cfg.PCMFrameBytes() }
 func (o *opusCodec) WireMTU() int    { return 1024 }
 
