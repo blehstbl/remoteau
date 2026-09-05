@@ -112,6 +112,10 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return runRecv(remaining[1:], stdout, stderr, backend, format, effectiveDebug, logger)
 	case "send":
 		return runSend(remaining[1:], stdout, stderr, backend, format, effectiveDebug, logger)
+	case "serve":
+		return runServe(remaining[1:], stdout, stderr, backend, format, logger)
+	case "recv2":
+		return runRecv2(remaining[1:], stdout, stderr, backend, format, logger)
 	default:
 		printUsage(stderr, globals)
 		return fmt.Errorf("unknown subcommand %q", remaining[0])
@@ -130,9 +134,12 @@ func registerGlobalFlags(fs *flag.FlagSet, opts *globalOptions) {
 }
 
 func printUsage(w io.Writer, fs *flag.FlagSet) {
-	fmt.Fprintf(w, "Usage: remote-au [global flags] <version|devices|selftest|recv|send>\n\n")
+	fmt.Fprintf(w, "Usage: remote-au [global flags] <version|devices|selftest|recv|send|serve|recv2>\n\n")
 	fmt.Fprintln(w, "Global flags:")
 	fs.PrintDefaults()
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "serve  hosts the v2 engine (QUIC, pairing, discovery) for iPhone receivers")
+	fmt.Fprintln(w, "recv2  v2 test client: connect to a v2 host and play locally")
 }
 
 func runDevices(args []string, stdout io.Writer, backend audio.Backend) error {
