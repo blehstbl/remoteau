@@ -1,0 +1,6 @@
+#!/bin/sh
+# RemoteAU Companion — pre-remove
+set -e
+
+launchctl bootout gui/501/dev.remoteau.receiver 2>/dev/null || true
+exit 0

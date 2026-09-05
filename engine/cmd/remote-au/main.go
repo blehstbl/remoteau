@@ -142,6 +142,11 @@ func printUsage(w io.Writer, fs *flag.FlagSet) {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "serve  hosts the v2 engine (QUIC, pairing, discovery) for iPhone receivers")
 	fmt.Fprintln(w, "recv2  v2 test client: connect to a v2 host and play locally")
+	fmt.Fprintln(w, "relay  WAN relay process (payloads are sealed end-to-end)")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "SECURITY: `send` and `recv` implement the legacy remote-au v1 protocol,")
+	fmt.Fprintln(w, "which is UNENCRYPTED and trusts the local network. Prefer `serve` + a")
+	fmt.Fprintln(w, "v2 receiver for any normal use; keep v1 only for compatibility.")
 }
 
 func runDevices(args []string, stdout io.Writer, backend audio.Backend) error {

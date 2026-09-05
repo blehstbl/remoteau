@@ -1,0 +1,10 @@
+#!/bin/sh
+# RemoteAU Companion — post-install
+set -e
+
+# Register the receiver launch daemon.
+launchctl disable gui/501/dev.remoteau.receiver 2>/dev/null || true
+launchctl enable gui/501/dev.remoteau.receiver 2>/dev/null || true
+
+echo "RemoteAU Companion installed. The core IPA is unaffected."
+exit 0

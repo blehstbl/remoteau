@@ -34,6 +34,11 @@ Windows                                  iPhone
 
 ## Quick start (Phase 2 milestone — stock-compatible, works today)
 
+> ⚠️ **Legacy protocol notice**: `remote-au send`/`recv` speak the v1
+> protocol — **unencrypted, trusts the local network**. It exists for
+> compatibility and debugging. Prefer the v2 flow (`remote-au serve` +
+> iPhone pairing) for normal use.
+
 1. **Windows**: build the CLI (`engine/runtests.ps1` passes; build with
    `go build -o bin/remote-au.exe ./cmd/remote-au` inside `engine/`), then:
    ```

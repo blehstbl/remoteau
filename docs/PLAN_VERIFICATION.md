@@ -1,5 +1,9 @@
 # Plan Verification â€” remote_au_ios_codex_plan.md
 
+> **UPDATE 2026-09-05 (later)**: the gaps identified below were subsequently
+> addressed â€” see the "Resolution pass" section at the bottom. The original
+> audit text is preserved unchanged above that section for accuracy.
+
 Verified item-by-item against the actual code on 2026-09-05. Every claim
 below was checked by reading the implementation, not from memory. Status
 legend:
@@ -343,3 +347,104 @@ endpoints**, so no live WASAPI audio test was possible.
 3. Client-side host-cert pinning (Phase 5 security gap).
 4. v2 client media path: reorder + PLC + real stats + reconnect loop (closes most Phase 6/9/10 v2 gaps).
 5. Wire tray menus and iOS v2 pairing UI.
+
+---
+
+## Resolution pass (2026-09-05, after the audit above)
+
+Statuses after the fix pass. Items not listed here are unchanged from the
+audit.
+
+### Critical bugs — FIXED
+- **B1** ? Swift `encodeAnnounce` now writes the 4-byte advertised IPv4
+  (own primary address), byte-identical layout to remote-au.
+- **B2** ? Swift `decodeDiscovery` parses announces correctly
+  (instance+advertised+name, +1-byte v2 marker tolerated).
+- **B3** ? The v2 host replies with a **clean v1 announce** (parsable by any
+  stock remote-au finder) **plus** a type-3 v2 announce carrying the protocol
+  version; v1 parsers reject the unknown type safely. Verified by
+  `TestMultiReceiverFanout`/discovery tests.
+- **Pairing concurrency** ? fixed as well: simultaneous pairings now
+  serialize (mutex) instead of the second device being rejected
+  (surfaced by `TestMultiReceiverFanout`).
+
+### Phase 5 security — FIXED
+- Client-side **host certificate pinning**: `ClientOptions.TrustedFingerprints`
+  + mobile bridge loads stored peer fingerprints after the first pairing
+  (`TestClientRejectsUntrustedHost` proves a non-matching host is rejected).
+- Mobile trust store still file-based (Keychain = documented hardening).
+
+### Phase 2/3 metrics — FIXED
+- Burst-loss tracking (iOS `ReorderBuffer.maxBurstLoss` + Go clientMedia
+  `maxBurstLoss`), overrun framing in the UI ("Dropped (overrun) frames"),
+  drift-correction ratio, capture-clock Hz, and codec name surfaced in the
+  statistics view. Capture timestamps: still parsed-not-driving (drift uses
+  buffer level) — deviation documented, not a regression.
+
+### Phase 4 control plane — WIRED
+- STREAM_STOP ? (client sends on stop; host tears the stream down),
+  RESUME/RESUME_OK ? (`TestClientResumeAfterReconnect`: reconnect without
+  re-pairing or renegotiation), VOLUME ? (host applies per-receiver
+  volume/mute — `TestHostVolumeAndMute`), FORMAT_UPDATE/ACK ? (quality
+  controller switches PCM?Opus with a dwell timer; client rebuilds decoder),
+  complexity/appID ? negotiated. Source selection as a control message
+  remains host-local (documented).
+
+### Phase 6 — WIRED
+- v2 client media path: reorder window + PLC + real stats (loss/late/jitter/
+  buffer) measured and **sent** to the host, feeding the adaptive controller
+  with live data (`TestClientMediaReorderAndPLC`,
+  `TestClientMediaStatsAccumulate`). Opus itself still behind `-tags opus`
+  (needs a C toolchain; untested on this machine).
+
+### Phase 9 — WIRED (v2)
+- Reconnect loop with exponential backoff + resume (`ClientOptions.Reconnect`),
+  covering network loss and PC sleep/wake for v2. Capture-device hot switch
+  exposed to the tray (`SetSourceDevice`, `SetCaptureSource`).
+
+### Phase 7/8 UX — WIRED
+- iOS: discovery finder (v1+v2 announces), tappable PC cards, pairing sheet
+  with PIN entry, paired-PC list with forget, persisted settings
+  (preset/buffer/IP filter/v2 codec prefs), advanced controls, new stats rows.
+- Tray: live receiver list (with per-receiver mute), wired quality presets,
+  source selection submenu (default + render devices), mute, real log file
+  (`%AppData%\RemoteAU\engine.log`) + open-log-folder.
+- Codec display ? (hero line + stats).
+
+### Phase 12 — IMPLEMENTED
+- `remote-au relay` process (pure splice: control streams + media datagrams,
+  TLS on both legs) + **end-to-end sealed envelopes**: control payloads and
+  media payloads are AES-256-GCM sealed with a pairing-secret-derived key, so
+  the relay only ever sees ciphertext. `TestRelayEndToEnd` runs the full
+  flow through the relay. Host/client enable it via `--relay` /
+  `RelayAddr`. NAT-traversal beyond the relay remains future work (design).
+
+### Phase 13 — SUBSTANCE
+- Complete companion package layout: `DEBIAN/control|postinst|prerm`,
+  LaunchDaemons plist (KeepAlive receiver agent), MobileSubstrate filter +
+  tweak source (AirPods-aware start/stop), Theos Makefile. Not compiled
+  (no Theos here) — by design, optional.
+
+### Phase 14 — SUBSTANCE
+- Recording ?: per-stream WAV files (pre-volume) on the host
+  (`serve --record <dir>`), header patched on close.
+- Profiles ?: named profiles (Home/Gaming/Weak Wi-Fi/Remote) with JSON
+  persistence (`serve --profile <name>`); GUI presets map onto the same
+  presets.
+- Per-app capture: still design-only (`docs/PER_APP_CAPTURE.md`) —
+  deliberately deferred: it is untestable on this machine (no active audio
+  endpoints) and the plan gates it behind a validated main path.
+
+### Still open (unchanged)
+- **On-device / live-audio validation** — requires the real PC (audio
+  endpoints currently all disabled system-wide) and a physical iPhone.
+- iOS-side Opus decoding arrives with the linked XCFramework build.
+- Keychain-backed mobile trust store.
+- QR pairing; Wi-Fi "burst" feedback loop in the adaptive jitter policy
+  (burst metric now exists; the policy uses loss/jitter/underruns).
+- Root repo is still local-only (not published).
+
+### Test status after the pass
+`go build ./...` ? · `go vet` clean ? · full suite ? — including new tests:
+clientMedia reorder/PLC/stats, resume-after-reconnect, untrusted-host
+rejection, mute, multi-receiver fanout (2 clients), full relay end-to-end.

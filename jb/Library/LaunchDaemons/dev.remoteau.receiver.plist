@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>dev.remoteau.receiver</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Applications/RemoteAU.app/RemoteAU</string>
+		<string>--receiver-daemon</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<!-- More aggressive persistence than stock iOS allows (Phase 13). -->
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+		<key>Crashed</key>
+		<true/>
+	</dict>
+	<key>ProcessType</key>
+	<string>Background</string>
+</dict>
+</plist>

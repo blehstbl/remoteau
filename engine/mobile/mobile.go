@@ -180,6 +180,17 @@ func ConnectWithCaps(hostAddr, deviceName string, codecID, rate, channels, frame
 		}
 	}
 
+	// Pin the host certificate after pairing (Phase 5): stored peers carry
+	// the host's fingerprint; only that certificate is accepted.
+	trusted := map[string]bool{}
+	if peers, perr := storeRef.Peers(); perr == nil {
+		for _, p := range peers {
+			if p.Fingerprint != "" {
+				trusted[p.Fingerprint] = true
+			}
+		}
+	}
+
 	go func() {
 		defer func() {
 			mu.Lock()
@@ -213,9 +224,10 @@ func ConnectWithCaps(hostAddr, deviceName string, codecID, rate, channels, frame
 			OnState: func(state string) {
 				setState(state)
 			},
-			RequestedCaps: requested,
-			Reconnect:     true,
-			Logger:        log,
+			RequestedCaps:       requested,
+			TrustedFingerprints: trusted,
+			Reconnect:           true,
+			Logger:              log,
 		})
 		if err != nil {
 			fail(err)
