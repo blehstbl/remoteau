@@ -432,6 +432,12 @@ type hostStream struct {
 	muted    bool
 	fecBias  bool
 
+	// Receiver-selected control-plane state (Phase 15): the quality preset
+	// (QualityModeAuto on creation) and the receiver's reported lifecycle
+	// state, both surfaced in ReceiverInfo.
+	qualityMode   uint8
+	receiverState uint8
+
 	// Relay-mode media envelope (nil on direct connections).
 	sealer *relay.Sealer
 
@@ -516,6 +522,18 @@ func (h *Host) handleConnInner(ctx context.Context, conn *transportv2.Conn, rela
 		stSealer = sealer
 		first = opened
 		peerFP = fp
+	}
+
+	// RECEIVER_STATE announcements are asynchronous UI metadata and may
+	// precede the handshake; consume them and keep waiting for HELLO or
+	// RESUME (a receiver that has not said anything yet is "connecting",
+	// the zero state).
+	for first.Type == protocolv2.MsgReceiverState {
+		first, err = sess.RecvRaw(ctx)
+		if err != nil {
+			h.log.Warnf("first control message failed: %v", err)
+			return
+		}
 	}
 
 	if first.Type == protocolv2.MsgResume {
@@ -606,16 +624,18 @@ func (h *Host) notifyReceivers() {
 
 // ReceiverInfo describes one connected receiver for UIs.
 type ReceiverInfo struct {
-	DeviceID  string  `json:"device_id"`
-	Name      string  `json:"name"`
-	Addr      string  `json:"addr"`
-	LossPct   float64 `json:"loss_pct"`
-	JitterMs  float64 `json:"jitter_ms"`
-	RTTMs     float64 `json:"rtt_ms"`
-	BufMs     float64 `json:"buf_ms"`
-	Codec     string  `json:"codec"`
-	Volume    float64 `json:"volume"`
-	Muted     bool    `json:"muted"`
+	DeviceID    string  `json:"device_id"`
+	Name        string  `json:"name"`
+	Addr        string  `json:"addr"`
+	LossPct     float64 `json:"loss_pct"`
+	JitterMs    float64 `json:"jitter_ms"`
+	RTTMs       float64 `json:"rtt_ms"`
+	BufMs       float64 `json:"buf_ms"`
+	Codec       string  `json:"codec"`
+	Volume      float64 `json:"volume"`
+	Muted       bool    `json:"muted"`
+	State       string  `json:"state"`
+	QualityMode string  `json:"quality_mode"`
 }
 
 // Receivers snapshots the connected receivers.
@@ -626,16 +646,18 @@ func (h *Host) Receivers() []ReceiverInfo {
 	for _, st := range h.conns {
 		peerID := st.sess.PeerID()
 		out = append(out, ReceiverInfo{
-			DeviceID: hex.EncodeToString(peerID[:]),
-			Name:     st.name,
-			Addr:     st.conn.Inner().RemoteAddr().String(),
-			LossPct:  st.stats.lossEWMA,
-			JitterMs: st.stats.jitterEWMA,
-			RTTMs:    st.stats.rttEWMA,
-			BufMs:    st.stats.bufDepthEWMA,
-			Codec:    st.codecName(),
-			Volume:   st.volume,
-			Muted:    st.muted,
+			DeviceID:    hex.EncodeToString(peerID[:]),
+			Name:        st.name,
+			Addr:        st.conn.Inner().RemoteAddr().String(),
+			LossPct:     st.stats.lossEWMA,
+			JitterMs:    st.stats.jitterEWMA,
+			RTTMs:       st.stats.rttEWMA,
+			BufMs:       st.stats.bufDepthEWMA,
+			Codec:       st.codecName(),
+			Volume:      st.volume,
+			Muted:       st.muted,
+			State:       receiverStateName(st.receiverState),
+			QualityMode: qualityModeName(st.qualityMode),
 		})
 	}
 	return out
@@ -1244,6 +1266,48 @@ func (h *Host) handleControl(st *hostStream, m protocolv2.Message) {
 	case protocolv2.MsgFormatAck:
 		// Codec switch acknowledged by the receiver.
 		st.lastSwitch = time.Now()
+
+	case protocolv2.MsgQualityMode:
+		// Receiver picks a quality preset (Phase 15): remap the adaptive
+		// controller bounds unless the receiver manages quality itself.
+		qm, err := protocolv2.DecodeQualityMode(m.Payload)
+		if err != nil {
+			return
+		}
+		minB, maxB, fecBias, apply := qualityModeToBounds(qm.Mode)
+		if apply {
+			st.quality = quality.NewController(minB, maxB)
+			st.fecBias = fecBias
+		}
+		st.qualityMode = qm.Mode
+		h.log.Infof("receiver %q selected quality mode %s", st.name, qualityModeName(qm.Mode))
+		h.notifyReceivers()
+
+	case protocolv2.MsgSetSource:
+		// Receiver picks what the host captures; ack with a short detail.
+		src, err := protocolv2.DecodeSetSource(m.Payload)
+		if err != nil {
+			return
+		}
+		ok, detail := h.applySetSource(src)
+		if !ok {
+			h.log.Warnf("set-source rejected (kind %d %q): %s", src.Kind, src.Name, detail)
+		} else {
+			h.log.Infof("set-source applied: %s", detail)
+		}
+		_ = st.sess.SendRaw(protocolv2.Message{
+			Type:    protocolv2.MsgSetSourceAck,
+			Payload: protocolv2.AppendSetSourceAck(nil, protocolv2.SetSourceAck{OK: boolBit(ok), Detail: detail}),
+		})
+
+	case protocolv2.MsgReceiverState:
+		// Receiver lifecycle state for UIs (receiver-authoritative).
+		rs, err := protocolv2.DecodeReceiverState(m.Payload)
+		if err != nil {
+			return
+		}
+		st.receiverState = rs.State
+		h.notifyReceivers()
 
 	default:
 	}

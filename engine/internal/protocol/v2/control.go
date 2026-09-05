@@ -28,6 +28,10 @@ const (
 	MsgPong         uint16 = 0x0061
 	MsgResume       uint16 = 0x0070
 	MsgResumeOK     uint16 = 0x0071
+	MsgQualityMode  uint16 = 0x0080
+	MsgSetSource    uint16 = 0x0081
+	MsgSetSourceAck uint16 = 0x0082
+	MsgReceiverState uint16 = 0x0083
 )
 
 // Capabilities blob (fixed 13 bytes):
@@ -226,6 +230,80 @@ type ResumeOK struct {
 	FormatGen uint32
 }
 
+// Quality-mode presets carried by QUALITY_MODE: the receiver picks one and
+// the host maps it onto its adaptive-controller bounds and FEC policy.
+const (
+	QualityModeAuto          uint8 = 0 // host-managed adaptive quality
+	QualityModeLowestLatency uint8 = 1 // tight bitrate ceiling, no FEC
+	QualityModeLossless      uint8 = 2 // high-bitrate, lossless-leaning bounds
+	QualityModeRobust        uint8 = 3 // FEC pinned on
+	QualityModeAdvanced      uint8 = 4 // receiver-managed; host keeps its settings
+)
+
+// Source kinds carried by SET_SOURCE: what the host should capture.
+const (
+	SetSourceDefault  uint8 = 0 // system default render (loopback)
+	SetSourceDevice   uint8 = 1 // render device selected by name
+	SetSourceTestTone uint8 = 2 // synthetic test tone
+)
+
+// Receiver states carried by RECEIVER_STATE (receiver lifecycle for UIs).
+const (
+	ReceiverStateConnecting   uint8 = 0
+	ReceiverStatePairing      uint8 = 1
+	ReceiverStateBuffering    uint8 = 2
+	ReceiverStatePlaying      uint8 = 3
+	ReceiverStateInterrupted  uint8 = 4
+	ReceiverStateReconnecting uint8 = 5
+	ReceiverStateStopped      uint8 = 6
+)
+
+// QualityMode is the QUALITY_MODE payload.
+type QualityMode struct {
+	Mode uint8
+}
+
+// SetSource is the SET_SOURCE payload. Name is the UTF-8 device name used
+// when Kind is SetSourceDevice (empty otherwise).
+type SetSource struct {
+	Kind uint8
+	Name string
+}
+
+// SetSourceAck is the SET_SOURCE_ACK payload: the host confirms or rejects
+// a source switch with a short human-readable detail.
+type SetSourceAck struct {
+	OK     uint8
+	Detail string
+}
+
+// ReceiverState is the RECEIVER_STATE payload.
+type ReceiverState struct {
+	State uint8
+}
+
+// String renders the state for display.
+func (r ReceiverState) String() string {
+	switch r.State {
+	case ReceiverStateConnecting:
+		return "connecting"
+	case ReceiverStatePairing:
+		return "pairing"
+	case ReceiverStateBuffering:
+		return "buffering"
+	case ReceiverStatePlaying:
+		return "playing"
+	case ReceiverStateInterrupted:
+		return "interrupted"
+	case ReceiverStateReconnecting:
+		return "reconnecting"
+	case ReceiverStateStopped:
+		return "stopped"
+	default:
+		return fmt.Sprintf("receiver-state-%d", r.State)
+	}
+}
+
 // Framing --------------------------------------------------------------------
 
 // MaxControlPayload bounds control message payloads.
@@ -396,4 +474,78 @@ func DecodeStats(b []byte) (Stats, error) {
 	s.Underruns = binary.LittleEndian.Uint32(b[14:18])
 	s.DriftPpm = int32(binary.LittleEndian.Uint32(b[18:22]))
 	return s, nil
+}
+
+// namePayloadLen validates the fixed part of a `u8 | str16` payload and
+// returns the expected name length.
+func namePayloadLen(b []byte, what string) (int, error) {
+	if len(b) < 3 {
+		return 0, fmt.Errorf("%s truncated", what)
+	}
+	return int(binary.LittleEndian.Uint16(b[1:3])), nil
+}
+
+func AppendQualityMode(dst []byte, q QualityMode) []byte {
+	return append(dst, q.Mode)
+}
+
+func DecodeQualityMode(b []byte) (QualityMode, error) {
+	if len(b) != 1 {
+		return QualityMode{}, errors.New("quality-mode length mismatch")
+	}
+	if b[0] > QualityModeAdvanced {
+		return QualityMode{}, fmt.Errorf("v2 quality mode out of range: %d", b[0])
+	}
+	return QualityMode{Mode: b[0]}, nil
+}
+
+func AppendSetSource(dst []byte, s SetSource) []byte {
+	dst = append(dst, s.Kind)
+	dst = binary.LittleEndian.AppendUint16(dst, uint16(len(s.Name)))
+	return append(dst, s.Name...)
+}
+
+func DecodeSetSource(b []byte) (SetSource, error) {
+	nameLen, err := namePayloadLen(b, "set-source")
+	if err != nil {
+		return SetSource{}, err
+	}
+	if len(b) != 3+nameLen {
+		return SetSource{}, errors.New("set-source length mismatch")
+	}
+	if b[0] > SetSourceTestTone {
+		return SetSource{}, fmt.Errorf("v2 set-source kind out of range: %d", b[0])
+	}
+	return SetSource{Kind: b[0], Name: string(b[3:])}, nil
+}
+
+func AppendSetSourceAck(dst []byte, a SetSourceAck) []byte {
+	dst = append(dst, a.OK)
+	dst = binary.LittleEndian.AppendUint16(dst, uint16(len(a.Detail)))
+	return append(dst, a.Detail...)
+}
+
+func DecodeSetSourceAck(b []byte) (SetSourceAck, error) {
+	detailLen, err := namePayloadLen(b, "set-source-ack")
+	if err != nil {
+		return SetSourceAck{}, err
+	}
+	if len(b) != 3+detailLen {
+		return SetSourceAck{}, errors.New("set-source-ack length mismatch")
+	}
+	return SetSourceAck{OK: b[0], Detail: string(b[3:])}, nil
+}
+
+func AppendReceiverState(dst []byte, r ReceiverState) []byte {
+	return append(dst, r.State)
+}
+
+func DecodeReceiverState(b []byte) (ReceiverState, error) {
+	if len(b) != 1 {
+		return ReceiverState{}, errors.New("receiver-state length mismatch")
+	}
+	if b[0] > ReceiverStateStopped {
+		return ReceiverState{}, fmt.Errorf("v2 receiver state out of range: %d", b[0])
+	}
+	return ReceiverState{State: b[0]}, nil
 }

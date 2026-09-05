@@ -183,6 +183,14 @@ final class AudioEngineController {
         os_unfair_lock_unlock(&targetLock)
     }
 
+    /// Re-arms the drift controller around the current target without
+    /// clearing the ring (controlled re-prime after a capture-clock
+    /// discontinuity). Audio keeps flowing; only drift state is reset.
+    func resetDrift() {
+        let target = currentTargetFramesLocked()
+        ring.configureDrift(targetFrames: target, sampleRate: outputSampleRate)
+    }
+
     private func currentTargetFramesLocked() -> Double {
         os_unfair_lock_lock(&targetLock)
         defer { os_unfair_lock_unlock(&targetLock) }

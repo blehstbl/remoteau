@@ -8,6 +8,10 @@ on:
       - "ios/**"
       - ".github/workflows/build-ipa.yml"
 
+env:
+  OPUS_VERSION: "1.4"
+  OPUS_SHA256: "c9b32b4253be5ae63d1ff16eea06b94b5f0f2951b7a02aceef58e3a3ce49c51f"
+
 jobs:
   framework:
     runs-on: macos-14
@@ -18,15 +22,87 @@ jobs:
         with:
           go-version: "1.25"
 
-      - name: Build RemoteAU.xcframework (gomobile)
+      - name: Download and verify Opus source (pinned)
         run: |
+          set -eo pipefail
+          cd "$GITHUB_WORKSPACE"
+          curl -sSL --retry 3 -o opus.tar.gz \
+            "https://github.com/xiph/opus/releases/download/v${OPUS_VERSION}/opus-${OPUS_VERSION}.tar.gz"
+          echo "${OPUS_SHA256}  opus.tar.gz" | shasum -a 256 -c -
+
+      # Static libopus for iOS (device arm64) and the simulator
+      # (arm64 + x86_64, merged into one fat archive). Any failure here must
+      # fail the job - no silent PCM-only framework.
+      - name: Build libopus for iOS (device + simulator)
+        run: |
+          set -eo pipefail
+          cd "$GITHUB_WORKSPACE"
+          tar -xf opus.tar.gz
+          SRC="$PWD/opus-${OPUS_VERSION}"
+          OUT="$PWD/opus-ios"
+          CC="$(xcrun -f clang)"
+
+          build_opus() {
+            prefix="$1"; host="$2"; cflags="$3"
+            cd "$SRC"
+            make distclean >/dev/null 2>&1 || true
+            CC="$CC" CFLAGS="$cflags" ./configure \
+              --prefix="$prefix" --host="$host" \
+              --disable-doc --disable-extra-programs \
+              --disable-shared --enable-static
+            make -j4
+            make install
+          }
+
+          build_opus "$OUT/device" aarch64-apple-darwin \
+            "-arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=13.0 -O2"
+          build_opus "$OUT/sim" aarch64-apple-darwin \
+            "-arch arm64 -isysroot $(xcrun --sdk iphonesimulator --show-sdk-path) -mios-simulator-version-min=13.0 -O2"
+          build_opus "$OUT/sim-x86" x86_64-apple-darwin \
+            "-arch x86_64 -isysroot $(xcrun --sdk iphonesimulator --show-sdk-path) -mios-simulator-version-min=13.0 -O2"
+
+          # Merge the two simulator archives into one fat static lib.
+          lipo -create "$OUT/sim/lib/libopus.a" "$OUT/sim-x86/lib/libopus.a" \
+            -output "$OUT/sim/lib/libopus-fat.a"
+          mv "$OUT/sim/lib/libopus-fat.a" "$OUT/sim/lib/libopus.a"
+
+          test -f "$OUT/device/lib/libopus.a"
+          test -f "$OUT/sim/lib/libopus.a"
+          test -f "$OUT/device/lib/pkgconfig/opus.pc"
+          test -f "$OUT/sim/lib/pkgconfig/opus.pc"
+
+      - name: Build RemoteAU.xcframework (gomobile, Opus)
+        run: |
+          set -eo pipefail
           export PATH="$PATH:$(go env GOPATH)/bin"
           go install golang.org/x/mobile/cmd/gomobile@latest
           go install golang.org/x/mobile/cmd/gobind@latest
           gomobile init
-          mkdir -p ios/Frameworks
-          gomobile bind -target ios,iossimulator \
-            -o ios/Frameworks/RemoteAU.xcframework -prefix RemoteAU ./engine/mobile
+          mkdir -p ios/Frameworks build
+
+          # Device slice: cgo flags point at the device libopus.
+          PKG_CONFIG_PATH="$GITHUB_WORKSPACE/opus-ios/device/lib/pkgconfig" \
+          CGO_CFLAGS="-I$GITHUB_WORKSPACE/opus-ios/device/include/opus" \
+          CGO_LDFLAGS="-L$GITHUB_WORKSPACE/opus-ios/device/lib -lopus" \
+          gomobile bind -target ios \
+            -o build/RemoteAU-ios.xcframework -prefix RemoteAU \
+            -tags "opus,nolibopusfile" ./engine/mobile
+
+          # Simulator slice: cgo flags point at the merged simulator libopus.
+          PKG_CONFIG_PATH="$GITHUB_WORKSPACE/opus-ios/sim/lib/pkgconfig" \
+          CGO_CFLAGS="-I$GITHUB_WORKSPACE/opus-ios/sim/include/opus" \
+          CGO_LDFLAGS="-L$GITHUB_WORKSPACE/opus-ios/sim/lib -lopus" \
+          gomobile bind -target iossimulator \
+            -o build/RemoteAU-sim.xcframework -prefix RemoteAU \
+            -tags "opus,nolibopusfile" ./engine/mobile
+
+          # Combine into one xcframework (proper Info.plist written by Xcode).
+          DEV_FW=$(find build/RemoteAU-ios.xcframework -maxdepth 2 -name RemoteAU.framework)
+          SIM_FW=$(find build/RemoteAU-sim.xcframework -maxdepth 2 -name RemoteAU.framework)
+          rm -rf ios/Frameworks/RemoteAU.xcframework
+          xcodebuild -create-xcframework \
+            -framework "$DEV_FW" -framework "$SIM_FW" \
+            -output ios/Frameworks/RemoteAU.xcframework
 
       - name: Upload framework
         uses: actions/upload-artifact@v4

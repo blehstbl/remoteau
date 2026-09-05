@@ -9,6 +9,9 @@ struct StatsSnapshot: Equatable {
     var lossPercent: Double = 0
     var underruns: UInt64 = 0
     var droppedFrames: UInt64 = 0
+    /// Drop-oldest events in the ring (distinct from `droppedFrames`, which
+    /// counts individual frames dropped).
+    var overrunEvents: UInt64 = 0
     var concealedFrames: UInt64 = 0
     var latePackets: UInt64 = 0
     var reorderedPackets: UInt64 = 0
@@ -20,6 +23,11 @@ struct StatsSnapshot: Equatable {
     var codec: String = "pcm"
     var driftRatio: Double = 1.0
     var maxBurstLoss: Int = 0
+    /// Capture-clock discontinuities detected by the reorder buffer.
+    var discontinuities: UInt64 = 0
+    /// Advisory only (v2 path): suggests enabling FEC while loss is bursty
+    /// or sustained. Hysteresis-managed by AdaptiveJitterPolicy.
+    var fecAdvisory: Bool = false
     var captureFrameRateHz: Double = 0
     var rttMs: Double = 0
 

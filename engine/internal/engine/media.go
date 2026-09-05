@@ -21,20 +21,21 @@ type clientMedia struct {
 	lastFlush  time.Time
 
 	// Stats (EWMA where noted).
-	packetsSeen      uint64
-	lossPackets      uint64
-	latePackets      uint64
-	reorderedPackets uint64
-	concealedFrames  uint64
-	lossEWMA         float64
-	lateEWMA         float64
-	jitterMsEWMA     float64
-	bufMsEWMA        float64
-	lastArrival      time.Time
+	packetsSeen        uint64
+	lossPackets        uint64
+	latePackets        uint64
+	reorderedPackets   uint64
+	concealedFrames    uint64
+	fecRecoveredFrames uint64
+	lossEWMA           float64
+	lateEWMA           float64
+	jitterMsEWMA       float64
+	bufMsEWMA          float64
+	lastArrival        time.Time
 
 	// Burst-loss tracking.
-	burstLoss      int
-	maxBurstLoss   int
+	burstLoss       int
+	maxBurstLoss    int
 	totalLossFrames uint64
 
 	frameMs float64
@@ -145,9 +146,18 @@ func (m *clientMedia) flush(now time.Time, force bool) {
 			// Not forcing: wait for the hold period before concealing.
 			break
 		}
-		// Conceal one frame and advance.
+		// Conceal one frame and advance. Prefer FEC reconstruction from
+		// the frame after the gap (libopus in-band FEC); fall back to PLC
+		// when the next frame isn't held, the codec lacks FEC support, or
+		// the FEC decode fails.
+		recovered := false
+		if next, ok := m.future[m.nextSeq+1]; ok {
+			recovered = m.emitFEC(next)
+		}
 		m.nextSeq++
-		m.emit(nil, true)
+		if !recovered {
+			m.emit(nil, true)
+		}
 	}
 
 	m.bufMsEWMA += 0.2 * (float64(len(m.future))*m.frameMs - m.bufMsEWMA)
@@ -162,6 +172,42 @@ func (m *clientMedia) emitSilence() {
 	out := make([]byte, m.codec.FrameBytes())
 	clear(out)
 	m.out(out)
+}
+
+// FECRecovered returns the number of missing frames recovered via FEC
+// decoding (as opposed to plain PLC concealment).
+func (m *clientMedia) FECRecovered() uint64 { return m.fecRecoveredFrames }
+
+// emitFEC reconstructs one missing frame from the wire payload of the frame
+// that follows it, using the codec's optional FECDecoder capability. It
+// keeps the loss-event bookkeeping (the wire frame was still missing — the
+// gap counts toward loss/burst stats) but tracks the successful recovery in
+// fecRecoveredFrames instead of concealedFrames. Returns false when the
+// codec doesn't support FEC, there's no payload, or the decode failed, so
+// the caller can fall back to the plain PLC path.
+func (m *clientMedia) emitFEC(wire []byte) bool {
+	if m.out == nil || m.codec == nil || len(wire) == 0 {
+		return false
+	}
+	fec, ok := m.codec.(codec.FECDecoder)
+	if !ok {
+		return false
+	}
+	out := make([]byte, m.codec.FrameBytes())
+	n, err := fec.DecodeFEC(wire, out)
+	if err != nil || n <= 0 {
+		return false
+	}
+	m.lossPackets++
+	m.totalLossFrames++
+	m.lossEWMA += 0.05 * (1 - m.lossEWMA)
+	m.burstLoss++
+	if m.burstLoss > m.maxBurstLoss {
+		m.maxBurstLoss = m.burstLoss
+	}
+	m.fecRecoveredFrames++
+	m.out(out[:n])
+	return true
 }
 
 // emit decodes one wire frame (or conceals when payload is nil) and delivers

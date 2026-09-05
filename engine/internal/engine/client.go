@@ -80,6 +80,11 @@ type Client struct {
 	resumeToken [32]byte
 	lastSeq     uint32
 
+	// helloDone reports the handshake (hello/resume) completed on the
+	// current session: async receiver announcements (RECEIVER_STATE) are
+	// held back until then so the strict handshake windows stay clean.
+	helloDone bool
+
 	// Ping round-trip via the control handler (single-reader discipline).
 	pingMu     sync.Mutex
 	pingNext   uint32
@@ -170,11 +175,70 @@ func (c *Client) ensureIdentity() error {
 	return nil
 }
 
-// setState publishes a state transition to the OnState callback.
+// setState publishes a state transition to the OnState callback and mirrors
+// it to the host as a RECEIVER_STATE message once the session is established
+// (best effort; the host shows receiver lifecycle states in its UI).
 func (c *Client) setState(s string) {
 	if c.opts.OnState != nil {
 		c.opts.OnState(s)
 	}
+	state, ok := receiverStateForLocal(s)
+	if !ok || c.sess == nil || !c.helloDone {
+		return
+	}
+	_ = c.SendReceiverState(state)
+}
+
+// receiverStateForLocal maps a local state string to the closest wire
+// receiver state (ok=false when there is no meaningful match, e.g. errors).
+func receiverStateForLocal(s string) (uint8, bool) {
+	switch {
+	case strings.HasPrefix(s, "reconnecting"):
+		return protocolv2.ReceiverStateReconnecting, true
+	case s == "connecting":
+		return protocolv2.ReceiverStateConnecting, true
+	case s == "streaming":
+		return protocolv2.ReceiverStatePlaying, true
+	case s == "idle" || s == "stopped":
+		return protocolv2.ReceiverStateStopped, true
+	default:
+		return 0, false
+	}
+}
+
+// SetQualityMode asks the host to apply a quality preset (Phase 15). The
+// host remaps its adaptive controller bounds; Advanced keeps host settings.
+func (c *Client) SetQualityMode(mode uint8) error {
+	if c.sess == nil {
+		return errors.New("engine: client is not connected")
+	}
+	return c.sess.SendRaw(protocolv2.Message{
+		Type:    protocolv2.MsgQualityMode,
+		Payload: protocolv2.AppendQualityMode(nil, protocolv2.QualityMode{Mode: mode}),
+	})
+}
+
+// SetSource asks the host to switch its capture source (system default,
+// named playback device, or synthetic test tone).
+func (c *Client) SetSource(kind uint8, name string) error {
+	if c.sess == nil {
+		return errors.New("engine: client is not connected")
+	}
+	return c.sess.SendRaw(protocolv2.Message{
+		Type:    protocolv2.MsgSetSource,
+		Payload: protocolv2.AppendSetSource(nil, protocolv2.SetSource{Kind: kind, Name: name}),
+	})
+}
+
+// SendReceiverState reports the receiver's lifecycle state to the host.
+func (c *Client) SendReceiverState(state uint8) error {
+	if c.sess == nil {
+		return errors.New("engine: client is not connected")
+	}
+	return c.sess.SendRaw(protocolv2.Message{
+		Type:    protocolv2.MsgReceiverState,
+		Payload: protocolv2.AppendReceiverState(nil, protocolv2.ReceiverState{State: state}),
+	})
 }
 
 // Run connects, pairs if needed, requests the stream and receives media
@@ -278,6 +342,7 @@ func (c *Client) runOnce(ctx context.Context) error {
 	}
 	c.sess = sess
 	defer sess.Close()
+	c.helloDone = false
 	c.setState("connecting")
 
 	clientCaps := c.opts.RequestedCaps
@@ -297,12 +362,14 @@ func (c *Client) runOnce(ctx context.Context) error {
 	var activeCaps protocolv2.Caps
 	if resumed {
 		activeCaps = ack.Active
+		c.helloDone = true
 		c.log.Infof("resumed stream (fmtGen=%d)", ack.FormatGen)
 	} else {
 		hostHello, err := sess.ExchangeHellos(ctx, c.opts.Name, clientCaps)
 		if err != nil {
 			return fmt.Errorf("hello: %w", err)
 		}
+		c.helloDone = true
 		c.resumeToken = sess.ResumeToken()
 		c.log.Infof("host %q (id %x…)", hostHello.DeviceName, hostHello.DeviceID[:4])
 
@@ -391,15 +458,33 @@ func (c *Client) handleControl(m protocolv2.Message) {
 		if err != nil {
 			return
 		}
-		dec, err := codec.New(capsToCodecConfig(fu.Caps), c.log)
-		if err != nil {
-			return
+		// Rebuild the decoder only when the negotiated format actually
+		// changes the decode configuration (bitrate/FEC/DTX/complexity are
+		// encoder-side settings a decoder ignores). Always ack regardless.
+		want := capsToCodecConfig(fu.Caps)
+		rebuild := false
+		if cur := c.currentCodec(); cur == nil {
+			rebuild = true
+		} else {
+			have := cur.Config()
+			rebuild = have.IsOpus != want.IsOpus ||
+				have.SampleRate != want.SampleRate ||
+				have.Channels != want.Channels ||
+				have.FrameMs != want.FrameMs
 		}
-		c.setCodec(dec)
-		c.mediaM.Lock()
-		c.media = newClientMedia(dec, c.opts.OnMedia)
-		c.mediaM.Unlock()
-		c.log.Infof("format updated: codec=%d frameMs=%d (gen %d)", fu.Caps.Codec, fu.Caps.FrameMs, fu.FormatGen)
+		if rebuild {
+			dec, err := codec.New(want, c.log)
+			if err != nil {
+				return
+			}
+			c.setCodec(dec)
+			c.mediaM.Lock()
+			c.media = newClientMedia(dec, c.opts.OnMedia)
+			c.mediaM.Unlock()
+			c.log.Infof("format updated: codec=%d frameMs=%d (gen %d)", fu.Caps.Codec, fu.Caps.FrameMs, fu.FormatGen)
+		} else {
+			c.log.Debugf("format update gen %d: decoder config unchanged; ack only", fu.FormatGen)
+		}
 		_ = c.sess.SendRaw(protocolv2.Message{
 			Type:    protocolv2.MsgFormatAck,
 			Payload: protocolv2.AppendFormatAck(nil, protocolv2.FormatAck{FormatGen: fu.FormatGen, Applied: 1}),

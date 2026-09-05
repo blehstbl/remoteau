@@ -23,6 +23,7 @@ final class PCMRing {
 
     // Statistics (updated under the lock, read from anywhere).
     private var droppedFramesCount: UInt64 = 0
+    private var overrunEvents: UInt64 = 0
     private var underrunCount: UInt64 = 0
     private var peakUsedBytes: Int = 0
 
@@ -67,6 +68,7 @@ final class PCMRing {
             let dropOldest = alignUp(n - free)
             consumeLocked(dropOldest)
             droppedFramesCount += UInt64(dropOldest / bytesPerFrame)
+            overrunEvents &+= 1
         }
         writeLocked(bytes, n)
         if usedBytes > peakUsedBytes { peakUsedBytes = usedBytes }
@@ -179,6 +181,14 @@ final class PCMRing {
         os_unfair_lock_lock(&lock)
         defer { os_unfair_lock_unlock(&lock) }
         return droppedFramesCount
+    }
+
+    /// Number of drop-oldest overrun events (distinct from `droppedFrames`,
+    /// which counts individual frames dropped).
+    var overruns: UInt64 {
+        os_unfair_lock_lock(&lock)
+        defer { os_unfair_lock_unlock(&lock) }
+        return overrunEvents
     }
 
     var underruns: UInt64 {

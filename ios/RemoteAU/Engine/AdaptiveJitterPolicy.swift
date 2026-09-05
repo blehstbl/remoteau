@@ -56,6 +56,10 @@ struct AdaptiveJitterPolicy {
 
     // Internal state (ms).
     private(set) var currentTargetMs: Double
+    /// Advisory only (for the v2 engine path): suggests enabling FEC while
+    /// loss arrives in bursts or at a high rate. Updated with hysteresis in
+    /// update().
+    private(set) var fecAdvisory = false
     private var lastChange: TimeInterval = 0
     private var stableSince: TimeInterval = 0
 
@@ -71,22 +75,27 @@ struct AdaptiveJitterPolicy {
     private let holdAfterChange: TimeInterval = 1.0
     private let improvementHold: TimeInterval = 4.0
 
-    init(preset: QualityPreset, sampleRate: Double) {
-        self.preset = preset
-        self.sampleRate = sampleRate
-        self.currentTargetMs = preset.profile.targetMs
-    }
-
     struct Network {
         var lossPercent: Double
         var jitterMs: Double
         var underruns: UInt64
         var bufferDepthMs: Double
+        /// Longest recent loss burst in packets (from ReorderBuffer).
+        var maxBurst: Int = 0
     }
 
     /// Advances the policy with the latest network sample. Returns the target
     /// in ms. Call at ~1 Hz.
     mutating func update(_ net: Network, now: TimeInterval) -> Double {
+        // FEC advisory (v2 path only; purely advisory here). Hysteresis:
+        // latch on at ≥3-packet bursts or ≥3% loss, clear only below 1% loss
+        // with bursts ≤1, so the flag doesn't flap around the thresholds.
+        if net.maxBurst >= 3 || net.lossPercent >= 3.0 {
+            fecAdvisory = true
+        } else if net.lossPercent < 1.0 && net.maxBurst <= 1 {
+            fecAdvisory = false
+        }
+
         let profile = preset.profile
         switch preset {
         case .lowestLatency, .lossless, .robust:
@@ -106,6 +115,10 @@ struct AdaptiveJitterPolicy {
         var required = floorMs
         required += net.jitterMs * 2.5
         required += net.lossPercent * 3.0
+        // Bursty loss needs more depth than the same average rate spread
+        // evenly: a 3% loss arriving in long bursts can empty the buffer in
+        // one hit, so each packet of the longest recent burst adds ~4 ms.
+        required += Double(min(max(net.maxBurst, 0), 8)) * 4.0
         required += net.bufferDepthMs * 0.15 // mild feedback from buffer state
 
         if lastChange == 0 {

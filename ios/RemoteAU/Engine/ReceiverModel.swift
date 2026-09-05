@@ -516,12 +516,26 @@ final class ReceiverModel: ObservableObject {
     private func housekeeping(now: Double) {
         guard running.value else { return }
 
+        // Controlled re-prime after a capture-clock discontinuity: reset the
+        // adaptive policy and drift state but keep the buffers, so audio
+        // keeps flowing. The audio thread's 1 Hz pass and the utility timer
+        // both land here; consumeReprime() returns true exactly once.
+        let reprime = reorder.withLock { rb -> Bool in
+            guard let rb else { return false }
+            return rb.consumeReprime()
+        }
+        if reprime {
+            policy.withLock { $0.reset() }
+            audio.resetDrift()
+        }
+
         // Adaptive jitter target.
         let net = AdaptiveJitterPolicy.Network(
             lossPercent: reorder.value?.lossPercent ?? 0,
             jitterMs: reorder.value?.arrivalJitterMs ?? 0,
             underruns: ring.underruns &- underrunBaseline,
-            bufferDepthMs: audio.ringDepthMs
+            bufferDepthMs: audio.ringDepthMs,
+            maxBurst: reorder.value?.maxBurstLoss ?? 0
         )
         var targetMs = policy.withLock { p -> Double in
             p.update(net, now: now)
@@ -548,6 +562,9 @@ final class ReceiverModel: ObservableObject {
         s.codec = "pcm"
         s.driftRatio = audio.driftRatio
         s.maxBurstLoss = reorder.value?.maxBurstLoss ?? 0
+        s.overrunEvents = ring.overruns
+        s.discontinuities = reorder.value?.discontinuities ?? 0
+        s.fecAdvisory = policy.value.fecAdvisory
         s.captureFrameRateHz = reorder.value?.captureFrameRateHz ?? 0
 
         let packets = s.packetsSeen

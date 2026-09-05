@@ -1,0 +1,123 @@
+name: Release Windows
+
+on:
+  workflow_dispatch:
+
+env:
+  OPUS_VERSION: "1.4"
+  OPUS_SHA256: "c9b32b4253be5ae63d1ff16eea06b94b5f0f2951b7a02aceef58e3a3ce49c51f"
+  OPUS_PREFIX: ${{ github.workspace }}\opus-build
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+
+      # MinGW-w64 gcc + pkg-config + make for the libopus build and the
+      # cgo Opus builds.
+      - name: Install MinGW-w64 toolchain (MSYS2)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          release: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-pkgconf
+            make
+
+      # The go tool invokes the literal `pkg-config` binary for cgo
+      # `#cgo pkg-config:` directives; provide a shim if only pkgconf exists.
+      - name: Ensure pkg-config shim
+        run: |
+          if (-not (Get-Command pkg-config -ErrorAction SilentlyContinue)) {
+            $pc = Get-Command pkgconf -ErrorAction SilentlyContinue
+            if (-not $pc) { Write-Host "Neither pkg-config nor pkgconf found on PATH"; exit 1 }
+            $dst = Join-Path (Split-Path -Parent $pc.Source) "pkg-config.exe"
+            Copy-Item $pc.Source $dst
+            Write-Host "Created shim: $dst"
+          }
+
+      - name: Download and verify Opus source (pinned)
+        run: |
+          $url = "https://github.com/xiph/opus/releases/download/v$($env:OPUS_VERSION)/opus-$($env:OPUS_VERSION).tar.gz"
+          Write-Host "Downloading $url"
+          curl.exe -sSL --retry 3 -o opus.tar.gz $url
+          if ($LASTEXITCODE -ne 0) { Write-Host "download failed"; exit 1 }
+          $h = (Get-FileHash "opus.tar.gz" -Algorithm SHA256).Hash.ToLower()
+          if ($h -ne $env:OPUS_SHA256) {
+            Write-Host "SHA256 mismatch: got $h want $($env:OPUS_SHA256)"
+            exit 1
+          }
+
+      # Static libopus via MinGW-w64. A failure here must fail the job -
+      # there is no silent PCM-only fallback for the release artifact.
+      - name: Build libopus (static, MinGW-w64)
+        shell: msys2 {0}
+        run: |
+          set -e
+          WS=$(cygpath -u "$GITHUB_WORKSPACE")
+          prefix=$(cygpath -m "$GITHUB_WORKSPACE/opus-build")
+          tar -xf "$WS/opus.tar.gz" -C "$WS"
+          cd "$WS/opus-$OPUS_VERSION"
+          ./configure --prefix="$prefix" \
+            --disable-doc --disable-extra-programs \
+            --disable-shared --enable-static
+          make -j4
+          make install
+          test -f "$WS/opus-build/lib/libopus.a"
+          echo "libopus built into $prefix"
+
+      - name: Build release binaries (Opus + PCM fallback)
+        run: |
+          & "$env:GITHUB_WORKSPACE\engine\scripts\build-windows.ps1" -OpusRoot "$env:OPUS_PREFIX"
+
+      - name: Package Opus release (remote-au-windows.zip)
+        run: |
+          $tmp = "package\remote-au-windows"
+          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+          $notice = @(
+            "remote-au - network audio sender (Windows)"
+            ""
+            "This distribution includes Opus audio codec (opus 1.4, built from the"
+            "pinned source https://github.com/xiph/opus/releases/download/v1.4/opus-1.4.tar.gz)."
+            "Copyright 2001-2011 Xiph.Org Foundation, Skype Limited, Octasic,"
+            "Jean-Marc Valin, Timothy B. Terriberry, CSIRO, and other contributors."
+            "Redistribution and use in source and binary forms, with or without"
+            "modification, are permitted provided that the conditions of the"
+            "3-clause BSD license are met (see https://opus-codec.org/license)."
+            ""
+            "Go bindings: github.com/hraban/opus (BSD 2-clause)."
+            "The Go engine binaries also embed the Go runtime (BSD 3-clause)."
+          )
+          Set-Content -Path (Join-Path $tmp "NOTICE.txt") -Value $notice -Encoding UTF8
+          Copy-Item "engine\bin\release\*" $tmp -Force
+          Compress-Archive -Path "$tmp\*" -DestinationPath "remote-au-windows.zip" -Force
+          Get-ChildItem "remote-au-windows.zip"
+
+      - name: Package PCM-only debug build (remote-au-windows-pcm.zip)
+        run: |
+          Compress-Archive -Path "engine\bin\release-pcm\*" -DestinationPath "remote-au-windows-pcm.zip" -Force
+          Get-ChildItem "remote-au-windows-pcm.zip"
+
+      - name: Upload Opus release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: remote-au-windows
+          path: remote-au-windows.zip
+          if-no-files-found: error
+
+      - name: Upload PCM-only debug artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: remote-au-windows-pcm
+          path: remote-au-windows-pcm.zip
+          if-no-files-found: error

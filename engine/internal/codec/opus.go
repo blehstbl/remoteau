@@ -17,9 +17,9 @@ type opusCodec struct {
 	dec    *opus.Decoder
 	logger logging.Logger
 
-	pcmBuf   []float32
-	encIn    []float32
-	decOut   []float32
+	pcmBuf []float32
+	encIn  []float32
+	decOut []float32
 }
 
 func newOpusCodec(cfg Config, logger logging.Logger) (Codec, error) {
@@ -74,11 +74,11 @@ func newOpusCodec(cfg Config, logger logging.Logger) (Codec, error) {
 
 func opusApp(id int) (opus.Application, error) {
 	switch id {
-	case 0, OpusAppAudio:
+	case OpusAppAudio:
 		return opus.AppAudio, nil
-	case 1, OpusAppVoIP:
+	case OpusAppVoIP:
 		return opus.AppVoIP, nil
-	case 2, OpusAppLowDelay:
+	case OpusAppLowDelay:
 		return opus.AppRestrictedLowdelay, nil
 	default:
 		return opus.AppAudio, nil
@@ -136,6 +136,30 @@ func (o *opusCodec) DecodeFrame(wire []byte, lost bool, out []byte) (int, error)
 	return n * 2, nil
 }
 
+// DecodeFEC implements codec.FECDecoder: reconstructs the PCM of the frame
+// *before* wire from the in-band FEC data it carries. hraban/opus's
+// DecodeFECFloat32(data, pcm) returns only an error and requires a buffer of
+// exactly the missing frame duration; when the packet carries no FEC data
+// libopus automatically falls back to PLC, so a nil error can still mean
+// synthesized audio (callers treat any error as "fall back to PLC" and the
+// output as best-effort recovery either way).
+func (o *opusCodec) DecodeFEC(wire []byte, out []byte) (int, error) {
+	if len(wire) == 0 {
+		return 0, fmt.Errorf("opus fec decode: no data supplied")
+	}
+	samples := o.cfg.FrameSamples() * o.cfg.Channels
+	if err := o.dec.DecodeFECFloat32(wire, o.decOut[:samples]); err != nil {
+		return 0, fmt.Errorf("opus fec decode: %w", err)
+	}
+	n := samples
+	want := o.cfg.PCMFrameBytes()
+	if n*2 > want {
+		n = want / 2
+	}
+	f32ToS16(out[:n*2], o.decOut[:n])
+	return n * 2, nil
+}
+
 // SetBitrate updates the encoder bitrate (adaptive quality).
 func (o *opusCodec) SetBitrate(bps int) error {
 	return o.enc.SetBitrate(bps)
@@ -164,7 +188,7 @@ func f32ToS16(dst []byte, src []float32) {
 		if i*2+1 >= len(dst) {
 			break
 		}
-		s := int16(clampF(v * 32767.0))
+		s := int16(clampF(float64(v) * 32767.0))
 		dst[i*2] = byte(s & 0xFF)
 		dst[i*2+1] = byte(uint16(s) >> 8)
 	}

@@ -19,12 +19,26 @@ import (
 //     (Opus PLC) and the return value is the replacement PCM.
 type Codec interface {
 	Name() string
-	Config() Config   // the configuration this codec was built with
-	FrameBytes() int  // PCM bytes per encode input
-	WireMTU() int     // max wire frame size
+	Config() Config  // the configuration this codec was built with
+	FrameBytes() int // PCM bytes per encode input
+	WireMTU() int    // max wire frame size
 	EncodeFrame(pcm []byte) ([]byte, error)
 	DecodeFrame(wire []byte, lost bool, out []byte) (int, error)
 	Close() error
+}
+
+// FECDecoder is an OPTIONAL codec capability: loss recovery using in-band
+// forward error correction. Codecs that implement it can reconstruct the
+// PCM of a lost frame from the wire frame that *follows* it (libopus embeds
+// redundancy for the previous frame when the sender enables FEC). The
+// receiver checks for this interface and falls back to plain PLC when a
+// codec does not implement it (the PCM codec never does).
+type FECDecoder interface {
+	// DecodeFEC reconstructs the frame *before* `wire` (the next frame
+	// after the gap) into out as S16LE PCM and returns the number of PCM
+	// bytes written. Implementations may fall back to PLC internally when
+	// the packet carries no FEC data.
+	DecodeFEC(wire []byte, out []byte) (int, error)
 }
 
 // Config describes one negotiated codec configuration.
@@ -99,10 +113,10 @@ type pcmCodec struct {
 	cfg Config
 }
 
-func (p *pcmCodec) Name() string     { return "pcm" }
-func (p *pcmCodec) Config() Config   { return p.cfg }
-func (p *pcmCodec) FrameBytes() int  { return p.cfg.PCMFrameBytes() }
-func (p *pcmCodec) WireMTU() int     { return p.cfg.PCMFrameBytes() }
+func (p *pcmCodec) Name() string    { return "pcm" }
+func (p *pcmCodec) Config() Config  { return p.cfg }
+func (p *pcmCodec) FrameBytes() int { return p.cfg.PCMFrameBytes() }
+func (p *pcmCodec) WireMTU() int    { return p.cfg.PCMFrameBytes() }
 
 func (p *pcmCodec) EncodeFrame(pcm []byte) ([]byte, error) {
 	if len(pcm) != p.cfg.PCMFrameBytes() {

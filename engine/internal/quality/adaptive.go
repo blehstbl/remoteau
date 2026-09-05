@@ -1,7 +1,12 @@
 // Package quality implements RemoteAU's adaptive quality controller: it
-// turns smoothed network measurements into codec bitrate, FEC and jitter
-// target decisions with hysteresis so settings do not oscillate. This is the
+// turns smoothed network measurements into codec bitrate, FEC and codec
+// switch decisions with hysteresis so settings do not oscillate. This is the
 // improved take on EchoWarp's adaptive logic (Phase 6).
+//
+// Ownership split: the HOST owns codec, bitrate and FEC policy (this
+// package); the RECEIVER owns the jitter/buffering target
+// (receiver-authoritative). This package deliberately makes no jitter
+// target decisions.
 package quality
 
 import (
@@ -47,7 +52,6 @@ type Decision struct {
 	BitrateBps   int
 	FECEnabled   bool
 	ExpectedLoss int // opus encoder packet-loss percentage
-	JitterTargetMs float64
 	// SwitchToPCM/SwitchToOpus are hints used only in Auto mode when both
 	// codecs are negotiated. Zero values mean "keep current codec".
 	SwitchToPCM bool
@@ -126,7 +130,6 @@ func (c *Controller) Update(s Sample, now time.Time) Decision {
 		BitrateBps:   c.bitrate,
 		FECEnabled:   c.fec,
 		ExpectedLoss: c.expectedLoss,
-		JitterTargetMs: jitterTargetFor(level, c.jitterEWMA),
 		Level:        level,
 	}
 
@@ -194,19 +197,5 @@ func classify(loss, late, jitterMs, rttMs float64) Level {
 		return LevelFair
 	default:
 		return LevelPoor
-	}
-}
-
-// jitterTargetFor maps the level to a receiver jitter target in ms.
-func jitterTargetFor(level Level, jitterMs float64) float64 {
-	switch level {
-	case LevelExcellent:
-		return 12
-	case LevelGood:
-		return 20
-	case LevelFair:
-		return 45
-	default:
-		return 90
 	}
 }

@@ -3,15 +3,14 @@ module remote-au
 go 1.26.0
 
 require (
+	fyne.io/systray v1.12.2
 	github.com/gen2brain/malgo v0.11.25
+	github.com/hraban/opus v0.0.0-20260708213942-bde8e4304501
 	github.com/quic-go/quic-go v0.62.0
 	golang.org/x/sys v0.47.0
 )
 
-require (
-	fyne.io/systray v1.12.2 // indirect
-	github.com/godbus/dbus/v5 v5.1.0 // indirect
-)
+require github.com/godbus/dbus/v5 v5.1.0 // indirect
 
 require (
 	golang.org/x/crypto v0.56.0

@@ -3,11 +3,17 @@ import Foundation
 /// Packet-level reordering, gap handling and PCM loss concealment. Lives on
 /// the network thread; output is S16LE PCM pushed into the ring.
 ///
-/// Design (Phase 3):
+/// Design (Phase 3 / Phase 5):
 /// - A bounded reorder window holds packets that arrive early (seq >
 ///   expected) so mild reordering doesn't become loss.
 /// - Missing regions are concealed with an exponential-decay hold of the last
 ///   good sample — simple and safe (Opus mode later brings real PLC).
+/// - When good audio resumes after concealment, the first frames of the
+///   returning payload are crossfaded with the concealment tail so the seam
+///   doesn't click.
+/// - Capture-clock discontinuities (sender reset/loop, or forward jumps
+///   beyond two seconds) are counted and request a controlled re-prime
+///   instead of being treated as loss.
 /// - Tracks arrival jitter, loss, late and reordered packets for stats and
 ///   the adaptive target.
 final class ReorderBuffer {
@@ -42,6 +48,19 @@ final class ReorderBuffer {
     private(set) var captureFrameRateHz: Double = 0
     private var lastCaptureFrame: UInt64 = 0
     private var lastCaptureArrival: Double = 0
+
+    // Capture-clock continuity: `expectedCaptureFrame` is where the next good
+    // packet's captureFrame should land (previous + frames written). A value
+    // behind it, or ahead by more than two seconds, is a discontinuity.
+    private(set) var discontinuities: UInt64 = 0
+    private(set) var pendingReprime = false
+    private var expectedCaptureFrame: UInt64 = 0
+    private var captureClockValid = false
+
+    // Last generated concealment frames (S16LE, interleaved per channel),
+    // kept so the seam into returning good audio can be crossfaded.
+    private let concealTailFrames = 64
+    private var concealTail: [Int16] = []
 
     private var lastArrival: Double = 0
     private var lastFlush: Double = 0
@@ -132,6 +151,7 @@ final class ReorderBuffer {
 
     private func writeConsecutive(seq: UInt64, captureFrame: UInt64, payload: ArraySlice<UInt8>) {
         let frames = payload.count / bytesPerFrame
+        checkCaptureDiscontinuity(captureFrame: captureFrame, frames: frames)
         if nextSeq == nil {
             nextSeq = seq &+ UInt64(frames)
             ensureLastSample()
@@ -156,17 +176,87 @@ final class ReorderBuffer {
         lastCaptureFrame = captureFrame &+ UInt64(frames)
         lastCaptureArrival = now
     }
-        write(payload)
+
+    // MARK: Capture-clock continuity
+
+    /// Detects capture-clock discontinuities in the write path: a capture
+    /// frame behind the expected value (sender reset/loop) or ahead by more
+    /// than two seconds of frames is a clock jump, not ordinary packet loss.
+    /// The event is counted, a controlled re-prime is requested, and the new
+    /// value is accepted as the base — the gap is never concealed.
+    private func checkCaptureDiscontinuity(captureFrame: UInt64, frames: Int) {
+        if captureClockValid {
+            if captureFrame < expectedCaptureFrame {
+                discontinuities &+= 1
+                pendingReprime = true
+            } else if Double(captureFrame &- expectedCaptureFrame) > 2.0 * sampleRate {
+                discontinuities &+= 1
+                pendingReprime = true
+            }
+        }
+        expectedCaptureFrame = captureFrame &+ UInt64(frames)
+        captureClockValid = true
     }
 
-    private func write(_ payload: ArraySlice<UInt8>) {
-        let arr = payload
-        arr.withUnsafeBytes { raw in
+    /// Returns true once after a detected capture-clock discontinuity and
+    /// clears the pending flag (consumed by housekeeping for a re-prime).
+    func consumeReprime() -> Bool {
+        guard pendingReprime else { return false }
+        pendingReprime = false
+        return true
+    }
+
+    // MARK: Sink write (crossfade on resumption)
+
+    /// Writes one in-sequence packet downstream. When concealment audio was
+    /// just generated, the first frames of the returning real audio are
+    /// crossfaded with the concealment tail so the seam doesn't click. Runs
+    /// on the network thread.
+    private func sinkWrite(_ payload: ArraySlice<UInt8>) {
+        if concealTail.isEmpty {
+            writeDownstream(Array(payload))
+        } else {
+            writeDownstream(crossfadedWithTail(Array(payload)))
+            concealTail.removeAll()
+        }
+        // Last-sample memory tracks the real payload, never the blended copy.
+        rememberLastSamples(payload)
+    }
+
+    /// Pushes PCM bytes into the sink (ring write; non-blocking).
+    private func writeDownstream(_ bytes: [UInt8]) {
+        bytes.withUnsafeBytes { raw in
             if let base = raw.baseAddress {
                 sink?(base, raw.count)
             }
         }
-        rememberLastSamples(payload)
+    }
+
+    /// Blends the first frames of `payload` with the saved concealment tail
+    /// (linear ramp: payload 0→1, tail 1→0, ending fully on the payload) and
+    /// returns the result as a new array; the payload itself is left
+    /// untouched.
+    private func crossfadedWithTail(_ payload: [UInt8]) -> [UInt8] {
+        let channels = max(1, bytesPerFrame / 2)
+        let framesInPayload = payload.count / bytesPerFrame
+        let tailFrames = concealTail.count / channels
+        let n = min(concealTailFrames, tailFrames, framesInPayload)
+        guard n > 0 else { return payload }
+
+        var out = payload
+        for f in 0..<n {
+            let payloadGain = Float(f + 1) / Float(n)
+            let tailGain = 1.0 - payloadGain
+            for ch in 0..<channels {
+                let off = (f * channels + ch) * 2
+                let p = Int16(bitPattern: UInt16(payload[off + 1]) << 8 | UInt16(payload[off]))
+                let tail = concealTail[f * channels + ch]
+                let mixed = Int16(clamping: Int(Float(p) * payloadGain + Float(tail) * tailGain))
+                out[off] = UInt8(bitPattern: UInt8(mixed & 0xFF))
+                out[off + 1] = UInt8(bitPattern: UInt8((mixed >> 8) & 0xFF))
+            }
+        }
+        return out
     }
 
     private func rememberLastSamples(_ payload: ArraySlice<UInt8>) {
@@ -190,7 +280,8 @@ final class ReorderBuffer {
     }
 
     /// Conceals `frames` frames of missing audio: exponential-decay hold of
-    /// the last good sample per channel.
+    /// the last good sample per channel. The last few generated frames are
+    /// remembered so `sinkWrite` can crossfade the resumption seam.
     private func conceal(frames: Int) {
         guard frames > 0 else { return }
         concealedFrames += UInt64(frames)
@@ -217,6 +308,7 @@ final class ReorderBuffer {
                     let off = (f * channels + ch) * 2
                     chunk[off] = UInt8(bitPattern: UInt8(v & 0xFF))
                     chunk[off + 1] = UInt8(bitPattern: UInt8((v >> 8) & 0xFF))
+                    concealTail.append(v)
                 }
             }
             decay = pow(0.9994, Double(n)) * decay
@@ -226,6 +318,13 @@ final class ReorderBuffer {
                 }
             }
             remaining -= n
+        }
+
+        // Keep only the last few frames of synthetic audio for the resumption
+        // crossfade in sinkWrite.
+        let keepSamples = concealTailFrames * channels
+        if concealTail.count > keepSamples {
+            concealTail.removeFirst(concealTail.count - keepSamples)
         }
     }
 
@@ -247,5 +346,9 @@ final class ReorderBuffer {
         captureFrameRateHz = 0
         lastCaptureFrame = 0
         lastCaptureArrival = 0
+        concealTail.removeAll()
+        pendingReprime = false
+        expectedCaptureFrame = 0
+        captureClockValid = false
     }
 }
