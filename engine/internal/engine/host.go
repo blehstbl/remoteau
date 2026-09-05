@@ -41,6 +41,9 @@ type HostOptions struct {
 	DeviceSelector string
 	Format         audio.Format // capture format
 	MaxBitrate     int
+	// ToneMode selects the synthetic test pattern when CaptureSource is
+	// audio.SourceTestTone (Phase 11 diagnostics).
+	ToneMode audio.ToneMode
 
 	// OnPairingCode is invoked when an unpaired device starts pairing; the
 	// UI must display this code for the user to enter on the phone.
@@ -1376,6 +1379,15 @@ func (h *Host) ensureCaptureViaBackend() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.capture != nil {
+		return nil
+	}
+	if h.opts.CaptureSource == audio.SourceTestTone {
+		cap, err := audio.NewSyntheticCapture(h.opts.Format, h.opts.ToneMode, h.log)
+		if err != nil {
+			return fmt.Errorf("open synthetic source: %w", err)
+		}
+		h.capture = cap
+		h.log.Infof("USING SYNTHETIC TEST SOURCE - not real system audio")
 		return nil
 	}
 	if h.opts.Backend == nil {

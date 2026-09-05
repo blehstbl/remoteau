@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -37,9 +38,11 @@ func runServe(args []string, stdout, stderr io.Writer, backend audio.Backend, fo
 	recordDir := ""
 	profileName := ""
 	relayAddr := ""
+	toneModeName := "sine"
 	fs.StringVar(&recordDir, "record", recordDir, "record captured audio to WAV files in this directory")
 	fs.StringVar(&profileName, "profile", profileName, "apply a named profile (see profiles)")
 	fs.StringVar(&relayAddr, "relay", relayAddr, "register with this relay for WAN access")
+	fs.StringVar(&toneModeName, "tone-mode", toneModeName, "test-tone pattern: sine or click (with --source testtone)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -50,6 +53,15 @@ func runServe(args []string, stdout, stderr io.Writer, backend audio.Backend, fo
 	source, err := parseCaptureSource(sourceName)
 	if err != nil {
 		return err
+	}
+	var toneMode audio.ToneMode
+	if source == audio.SourceTestTone {
+		switch strings.ToLower(toneModeName) {
+		case "click", "impulse":
+			toneMode = audio.ToneClick
+		default:
+			toneMode = audio.ToneSine
+		}
 	}
 
 	store, err := pairing.NewWindowsStore()
@@ -91,6 +103,7 @@ func runServe(args []string, stdout, stderr io.Writer, backend audio.Backend, fo
 		OnPairingCode:  pairingCode,
 		RecordDir:      recordDir,
 		RelayAddr:      relayAddr,
+		ToneMode:       toneMode,
 		Logger:         logger,
 	})
 	if err != nil {
