@@ -9,10 +9,45 @@ on:
       - ".github/workflows/build-ipa.yml"
 
 jobs:
-  build:
+  framework:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Build RemoteAU.xcframework (gomobile)
+        run: |
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          gomobile init
+          mkdir -p ios/Frameworks
+          gomobile bind -target ios,iossimulator \
+            -o ios/Frameworks/RemoteAU.xcframework -prefix RemoteAU ./engine/mobile
+
+      - name: Upload framework
+        uses: actions/upload-artifact@v4
+        with:
+          name: RemoteAU-xcframework
+          path: ios/Frameworks/RemoteAU.xcframework
+
+  build:
+    needs: framework
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download framework
+        uses: actions/download-artifact@v4
+        with:
+          name: RemoteAU-xcframework
+          path: ios/Frameworks
+
+      - name: Enable v2 in project
+        run: python3 scripts/add-v2-dep.py
 
       - name: Install XcodeGen
         run: brew install xcodegen
