@@ -55,6 +55,10 @@ type Session struct {
 
 	localDeviceName string
 
+	// Relay-mode envelope protection (nil = direct connection).
+	seal func([]byte) ([]byte, error)
+	open func([]byte) ([]byte, error)
+
 	// Negotiated stream parameters (host side fills on STREAM_ACK).
 	activeCaps  protocolv2.Caps
 	formatGen   uint32
@@ -93,6 +97,16 @@ func New(conn *transportv2.Conn, role Role, localDeviceID [16]byte) (*Session, e
 func (s *Session) SetHandler(h Handler) {
 	s.mu.Lock()
 	s.handler = h
+	s.mu.Unlock()
+}
+
+// SetSealer enables relay-mode envelope protection: every control payload is
+// sealed/unsealed with an AEAD keyed from the pairing secret, so a relay
+// cannot read application data (Phase 12).
+func (s *Session) SetSealer(seal func([]byte) ([]byte, error), open func([]byte) ([]byte, error)) {
+	s.mu.Lock()
+	s.seal = seal
+	s.open = open
 	s.mu.Unlock()
 }
 
@@ -161,6 +175,13 @@ func (s *Session) send(m protocolv2.Message) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.seal != nil && len(m.Payload) > 0 {
+		sealed, err := s.seal(m.Payload)
+		if err != nil {
+			return fmt.Errorf("seal: %w", err)
+		}
+		m.Payload = sealed
+	}
 	return protocolv2.WriteMessage(s.bw, m)
 }
 
@@ -186,6 +207,13 @@ func (s *Session) recv(ctx context.Context) (protocolv2.Message, error) {
 				return r.m, ErrClosed
 			}
 			return r.m, r.err
+		}
+		if s.open != nil && len(r.m.Payload) > 0 {
+			plain, oerr := s.open(r.m.Payload)
+			if oerr != nil {
+				return protocolv2.Message{}, fmt.Errorf("open control envelope: %w", oerr)
+			}
+			r.m.Payload = plain
 		}
 		return r.m, nil
 	}

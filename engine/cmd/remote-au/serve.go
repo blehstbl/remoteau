@@ -14,8 +14,10 @@ import (
 	"remote-au/internal/engine"
 	"remote-au/internal/logging"
 	"remote-au/internal/pairing"
+	"remote-au/internal/relay"
 	"remote-au/internal/protocol/v2"
 	"remote-au/internal/transport"
+	"remote-au/internal/transport/v2"
 )
 
 // runServe hosts the v2 engine: QUIC + datagrams, pairing, discovery.
@@ -156,6 +158,41 @@ func runRecv2(args []string, stdout, stderr io.Writer, backend audio.Backend, fo
 
 	fmt.Fprintf(stdout, "recv2: connecting to %s\n", hostAddr)
 	return client.Run(ctx)
+}
+
+// runRelay is the Phase 12 relay process: splices phone↔PC QUIC connections
+// without interpreting application data (payloads are sealed end-to-end).
+func runRelay(args []string, stdout, stderr io.Writer, backend audio.Backend, format audio.Format, logger logging.Logger) error {
+	fs := flag.NewFlagSet("relay", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	addr := ":47020"
+	logLevel := "info"
+	fs.StringVar(&addr, "addr", addr, "relay listen address")
+	fs.StringVar(&logLevel, "log-level", logLevel, "relay log level")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("relay takes no positional arguments: %v", fs.Args())
+	}
+
+	// The relay uses its own throwaway identity; it never sees plaintext.
+	id, err := pairing.NewIdentity()
+	if err != nil {
+		return err
+	}
+	cert, err := transportv2.DeviceCertificate(id)
+	if err != nil {
+		return err
+	}
+	tlsCfg := transportv2.TLSConfig(cert, transportv2.FingerprintVerifier(nil, true))
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	l := func(line string) { logger.Infof("relay: %s", line) }
+	fmt.Fprintf(stdout, "relay listening on %s\n", addr)
+	return relay.RunRelay(ctx, addr, tlsCfg, l)
 }
 
 var _ = transport.TransportUDP

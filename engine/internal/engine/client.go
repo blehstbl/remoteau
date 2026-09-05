@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"encoding/hex"
+	"strings"
 	"os"
 	"sync"
 	"time"
@@ -12,6 +14,7 @@ import (
 	"remote-au/internal/logging"
 	"remote-au/internal/pairing"
 	"remote-au/internal/protocol/v2"
+	"remote-au/internal/relay"
 	"remote-au/internal/session"
 	"remote-au/internal/transport/v2"
 )
@@ -46,6 +49,13 @@ type ClientOptions struct {
 
 	// Reconnect enables the automatic reconnect loop (Phase 9).
 	Reconnect bool
+
+	// RelayAddr + HostDeviceID enable relay mode (Phase 12): the connection
+	// goes through the relay splice and all payloads are sealed with the
+	// pairing secret so the relay cannot read them. Requires a prior
+	// pairing with the host.
+	RelayAddr    string
+	HostDeviceID string // hex, 32 chars
 
 	Logger logging.Logger
 
@@ -229,14 +239,28 @@ func (c *Client) runOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// Trust model: pin the host when we know its fingerprint; accept any
-	// certificate only for a first (unpaired) connection — the PIN exchange
-	// then authenticates it.
-	verify := transportv2.FingerprintVerifier(c.opts.TrustedFingerprints, len(c.opts.TrustedFingerprints) == 0)
 
-	conn, err := transportv2.Dial(dialCtx, c.opts.HostAddr, transportv2.TLSConfig(cert, verify))
-	if err != nil {
-		return err
+	var sealer *relay.Sealer
+	verify := transportv2.FingerprintVerifier(c.opts.TrustedFingerprints, len(c.opts.TrustedFingerprints) == 0)
+	var conn *transportv2.Conn
+
+	if c.opts.RelayAddr != "" {
+		// Relay mode: identity is proven by the sealed control payloads (the
+		// TLS peer here is the relay), so certificate pinning does not apply.
+		verify = transportv2.FingerprintVerifier(nil, true)
+		sealer, err = c.relaySealer()
+		if err != nil {
+			return err
+		}
+		conn, err = c.dialRelay(dialCtx, byte('P'), c.opts.HostDeviceID)
+		if err != nil {
+			return fmt.Errorf("relay dial: %w", err)
+		}
+	} else {
+		conn, err = transportv2.Dial(dialCtx, c.opts.HostAddr, transportv2.TLSConfig(cert, verify))
+		if err != nil {
+			return err
+		}
 	}
 	c.conn = conn
 	defer func() {
@@ -248,6 +272,9 @@ func (c *Client) runOnce(ctx context.Context) error {
 	sess, err := session.New(conn, session.RoleClient, c.id.DeviceID())
 	if err != nil {
 		return err
+	}
+	if sealer != nil {
+		sess.SetSealer(sealer.Seal, sealer.Open)
 	}
 	c.sess = sess
 	defer sess.Close()
@@ -551,8 +578,71 @@ func (c *Client) flushLoop(stop chan struct{}) {
 	}
 }
 
+// relaySealer builds the envelope sealer from the stored pairing secret for
+// the configured host device.
+func (c *Client) relaySealer() (*relay.Sealer, error) {
+	var id [16]byte
+	b, err := hex.DecodeString(strings.TrimSpace(c.opts.HostDeviceID))
+	if err != nil || len(b) != 16 {
+		return nil, errors.New("relay: HostDeviceID must be 32 hex chars")
+	}
+	copy(id[:], b)
+	peers, err := c.opts.Store.Peers()
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range peers {
+		if p.ID == id {
+			return relay.NewSealer(p.PairingSecret)
+		}
+	}
+	return nil, errors.New("relay: no paired secret for this host; pair on the LAN first")
+}
+
+// dialRelay connects to the relay and registers (role + target id) on a
+// dedicated unidirectional stream, keeping the control stream clean.
+func (c *Client) dialRelay(ctx context.Context, role byte, targetIDHex string) (*transportv2.Conn, error) {
+	cert, err := transportv2.DeviceCertificate(c.id)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := transportv2.Dial(ctx, c.opts.RelayAddr, transportv2.TLSConfig(cert, transportv2.FingerprintVerifier(nil, true)))
+	if err != nil {
+		return nil, err
+	}
+	uni, err := conn.Inner().OpenUniStream()
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("relay registration stream: %w", err)
+	}
+	idBytes := []byte(strings.TrimSpace(targetIDHex))
+	if len(idBytes) == 0 || len(idBytes) > 64 {
+		_ = conn.Close()
+		return nil, errors.New("relay: bad device id")
+	}
+	head := []byte{role, byte(len(idBytes) >> 8), byte(len(idBytes))}
+	if _, err := uni.Write(head); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if _, err := uni.Write(idBytes); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	_ = uni.Close()
+	return conn, nil
+}
+
 // mediaLoop receives media datagrams into the reorder/PLC pipeline.
 func (c *Client) mediaLoop(ctx context.Context) error {
+	var sealer *relay.Sealer
+	if c.opts.RelayAddr != "" {
+		s, err := c.relaySealer()
+		if err != nil {
+			return err
+		}
+		sealer = s
+	}
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -574,6 +664,15 @@ func (c *Client) mediaLoop(ctx context.Context) error {
 			c.log.Debugf("drop media: %v", err)
 			continue
 		}
+		payload := media.Payload
+		if sealer != nil {
+			plain, oerr := sealer.Open(payload)
+			if oerr != nil {
+				c.log.Debugf("drop sealed media: %v", oerr)
+				continue
+			}
+			payload = plain
+		}
 		c.mediaM.Lock()
 		if c.media != nil {
 			c.lastSeq = media.Seq
@@ -582,7 +681,7 @@ func (c *Client) mediaLoop(ctx context.Context) error {
 			if media.Flags&protocolv2.FlagDTXSilence != 0 {
 				c.media.emitSilence()
 			} else {
-				c.media.accept(media.Seq, media.Flags, media.Payload)
+				c.media.accept(media.Seq, media.Flags, payload)
 			}
 		}
 		c.mediaM.Unlock()

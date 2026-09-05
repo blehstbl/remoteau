@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,6 +25,7 @@ import (
 	"remote-au/internal/pairing"
 	"remote-au/internal/protocol/v2"
 	"remote-au/internal/quality"
+	"remote-au/internal/relay"
 	"remote-au/internal/session"
 	"remote-au/internal/transport/v2"
 )
@@ -45,6 +47,9 @@ type HostOptions struct {
 	// OnReceiversChanged is invoked whenever the connected-receiver set or
 	// its stats change meaningfully (UI surface).
 	OnReceiversChanged func(receivers []ReceiverInfo)
+	// RelayAddr enables relay mode (Phase 12): register with this relay so
+	// receivers outside the LAN can reach us.
+	RelayAddr string
 	// PairingTimeout bounds each pairing exchange.
 	PairingTimeout time.Duration
 
@@ -162,6 +167,12 @@ func (h *Host) Run(ctx context.Context) error {
 	// loopback capture survives the user switching outputs (Phase 9).
 	go h.monitorDefaultEndpoint(ctx)
 
+	// Relay fallback (Phase 12): register with the relay so receivers can
+	// reach us from outside the LAN.
+	if h.opts.RelayAddr != "" {
+		go h.runRelayClient(ctx)
+	}
+
 	// Open capture lazily on first stream; a single shared capture feeds all
 	// receivers (fanout).
 	for {
@@ -266,6 +277,95 @@ func (h *Host) runDiscoveryV2(ctx context.Context, listenAddr net.Addr) error {
 	}
 }
 
+// openSealedFirst tries each paired peer's sealer to open a relayed control
+// payload. Valid AEAD authentication proves the sender holds the pairing
+// secret; the returned fingerprint is the stored peer's.
+func (h *Host) openSealedFirst(m protocolv2.Message) (fingerprint string, opened protocolv2.Message, err error) {
+	peers, perr := h.opts.Store.Peers()
+	if perr != nil {
+		return "", m, perr
+	}
+	for _, p := range peers {
+		sealer, serr := relay.NewSealer(p.PairingSecret)
+		if serr != nil {
+			continue
+		}
+		plain, oerr := sealer.Open(m.Payload)
+		if oerr != nil {
+			continue
+		}
+		out := m
+		out.Payload = plain
+		return p.Fingerprint, out, nil
+	}
+	return "", m, errors.New("relay: no paired peer could open the envelope")
+}
+
+func (h *Host) pairingSecretForFingerprint(fp string) ([]byte, error) {
+	peers, err := h.opts.Store.Peers()
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range peers {
+		if p.Fingerprint == fp {
+			return p.PairingSecret, nil
+		}
+	}
+	return nil, errors.New("relay: peer not found")
+}
+
+// runRelayClient registers this host with the relay and serves connections
+// spliced through it (Phase 12).
+func (h *Host) runRelayClient(ctx context.Context) {
+	for ctx.Err() == nil {
+		conn, err := h.dialRelay(ctx, 'H', func() string { id := h.id.DeviceID(); return hex.EncodeToString(id[:]) }())
+		if err != nil {
+			h.log.Warnf("relay: %v; retrying in 5s", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Second):
+			}
+			continue
+		}
+		h.handleConnInner(ctx, conn, true)
+		_ = conn.Close()
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+func (h *Host) dialRelay(ctx context.Context, role byte, idHex string) (*transportv2.Conn, error) {
+	cert, err := transportv2.DeviceCertificate(h.id)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := transportv2.Dial(ctx, h.opts.RelayAddr, transportv2.TLSConfig(cert, transportv2.FingerprintVerifier(nil, true)))
+	if err != nil {
+		return nil, err
+	}
+	uni, err := conn.Inner().OpenUniStream()
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	idBytes := []byte(strings.TrimSpace(idHex))
+	head := []byte{role, byte(len(idBytes) >> 8), byte(len(idBytes))}
+	if _, err := uni.Write(head); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if _, err := uni.Write(idBytes); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	_ = uni.Close()
+	return conn, nil
+}
+
 // monitorDefaultEndpoint watches the default render endpoint and reopens
 // loopback capture when it changes. Polling (no COM event sink) keeps the
 // implementation cgo-free and simple; 2s latency is imperceptible.
@@ -325,6 +425,9 @@ type hostStream struct {
 	muted    bool
 	fecBias  bool
 
+	// Relay-mode media envelope (nil on direct connections).
+	sealer *relay.Sealer
+
 	// Codec/stream bookkeeping.
 	formatGen  uint32
 	pendingGen uint32
@@ -352,8 +455,12 @@ type resumeState struct {
 }
 
 func (h *Host) handleConn(ctx context.Context, conn *transportv2.Conn) {
+	h.handleConnInner(ctx, conn, false)
+}
+
+func (h *Host) handleConnInner(ctx context.Context, conn *transportv2.Conn, relayed bool) {
 	remoteFP := PeerCertFingerprint(conn)
-	h.log.Infof("v2 connection from %s (cert %s…)", conn.Inner().RemoteAddr(), short(remoteFP))
+	h.log.Infof("v2 connection from %s (cert %s…, relayed=%v)", conn.Inner().RemoteAddr(), short(remoteFP), relayed)
 
 	sess, err := session.New(conn, session.RoleHost, h.id.DeviceID())
 	if err != nil {
@@ -369,16 +476,40 @@ func (h *Host) handleConn(ctx context.Context, conn *transportv2.Conn) {
 	hostCaps := h.offerCaps()
 
 	// The first control message decides the path: RESUME (reconnect without
-	// renegotiation) or HELLO (full flow). The host sends its own HELLO
-	// inside CompleteHello, after reading the receiver's.
+	// renegotiation) or HELLO (full flow). On relayed connections payloads
+	// are sealed; the speaking peer is identified by trying each stored
+	// pairing secret (valid AEAD = proof of the pairing).
 	first, err := sess.RecvRaw(ctx)
 	if err != nil {
 		h.log.Warnf("first control message failed: %v", err)
 		return
 	}
 
+	stSealer := (*relay.Sealer)(nil)
+	peerFP := remoteFP
+	if relayed {
+		fp, opened, oerr := h.openSealedFirst(first)
+		if oerr != nil {
+			h.log.Warnf("relay: cannot open sealed payload: %v", oerr)
+			return
+		}
+		secret, serr := h.pairingSecretForFingerprint(fp)
+		if serr != nil {
+			h.log.Warnf("relay: no pairing secret for %s…", short(fp))
+			return
+		}
+		sealer, serr := relay.NewSealer(secret)
+		if serr != nil {
+			return
+		}
+		sess.SetSealer(sealer.Seal, sealer.Open)
+		stSealer = sealer
+		first = opened
+		peerFP = fp
+	}
+
 	if first.Type == protocolv2.MsgResume {
-		if h.tryResume(sess, conn, first.Payload) {
+		if h.tryResume(sess, conn, first.Payload, stSealer) {
 			return
 		}
 		// Unknown/expired token: fall through to the full flow; the next
@@ -401,7 +532,7 @@ func (h *Host) handleConn(ctx context.Context, conn *transportv2.Conn) {
 	}
 	h.log.Infof("peer %q (id %x…)", peerHello.DeviceName, peerHello.DeviceID[:4])
 
-	paired := h.trusted[remoteFP]
+	paired := h.trusted[peerFP]
 	if !paired {
 		if err := h.runPairing(ctx, sess); err != nil {
 			if errors.Is(err, pairing.ErrPinMismatch) {
@@ -411,7 +542,7 @@ func (h *Host) handleConn(ctx context.Context, conn *transportv2.Conn) {
 			}
 			return
 		}
-		h.trusted[remoteFP] = true
+		h.trusted[peerFP] = true
 		h.log.Infof("paired with %q (%s…)", peerHello.DeviceName, short(remoteFP))
 	}
 
@@ -424,6 +555,7 @@ func (h *Host) handleConn(ctx context.Context, conn *transportv2.Conn) {
 		quality: quality.NewController(32000, maxInt(h.opts.MaxBitrate, 256000)),
 		volume:  1.0,
 		name:    peerHello.DeviceName,
+		sealer:  stSealer,
 	}
 	sess.SetHandler(func(m protocolv2.Message) { h.handleControl(st, m) })
 	h.registerStream(st)
@@ -744,7 +876,7 @@ func (h *Host) storeResumeState(st *hostStream) {
 
 // tryResume handles a RESUME message. On success it answers RESUME_OK,
 // re-attaches the stream and serves until the connection ends.
-func (h *Host) tryResume(sess *session.Session, conn *transportv2.Conn, payload []byte) bool {
+func (h *Host) tryResume(sess *session.Session, conn *transportv2.Conn, payload []byte, stSealer *relay.Sealer) bool {
 	if len(payload) < 36 {
 		return false
 	}
@@ -782,6 +914,7 @@ func (h *Host) tryResume(sess *session.Session, conn *transportv2.Conn, payload 
 		caps:      caps,
 		formatGen: formatGen,
 		pendingGen: formatGen,
+		sealer:    stSealer,
 	}
 	st.seq.Store(nextSeq)
 	codecImpl, err := codec.New(codecConfigFromCaps(caps), h.log)
@@ -941,6 +1074,14 @@ func (h *Host) sendLoop(st *hostStream, caps protocolv2.Caps, startSeq uint32) {
 					h.log.Warnf("encode: %v", err)
 					filled = 0
 					continue
+				}
+				if st.sealer != nil {
+					wire, err = st.sealer.Seal(wire)
+					if err != nil {
+						h.log.Warnf("seal media: %v", err)
+						filled = 0
+						continue
+					}
 				}
 	gen := st.formatGen
 	packet, err := protocolv2.AppendMedia(nil, protocolv2.Media{
