@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -14,8 +15,9 @@ import (
 	"remote-au/internal/engine"
 	"remote-au/internal/logging"
 	"remote-au/internal/pairing"
-	"remote-au/internal/relay"
+	"remote-au/internal/profiles"
 	"remote-au/internal/protocol/v2"
+	"remote-au/internal/relay"
 	"remote-au/internal/transport"
 	"remote-au/internal/transport/v2"
 )
@@ -32,6 +34,12 @@ func runServe(args []string, stdout, stderr io.Writer, backend audio.Backend, fo
 	fs.StringVar(&sourceName, "source", sourceName, "capture source: mic or loopback")
 	fs.StringVar(&deviceSelector, "device", deviceSelector, "capture device selector (see devices)")
 	fs.StringVar(&name, "name", name, "host name shown to receivers")
+	recordDir := ""
+	profileName := ""
+	relayAddr := ""
+	fs.StringVar(&recordDir, "record", recordDir, "record captured audio to WAV files in this directory")
+	fs.StringVar(&profileName, "profile", profileName, "apply a named profile (see profiles)")
+	fs.StringVar(&relayAddr, "relay", relayAddr, "register with this relay for WAN access")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -56,6 +64,22 @@ func runServe(args []string, stdout, stderr io.Writer, backend audio.Backend, fo
 		fmt.Fprintf(stdout, "\n*** PAIRING: enter code %s on the device ***\n\n", code)
 	}
 
+	// Profile (Phase 14): presets sync naturally with the GUIs.
+	if profileName != "" {
+		storeDir, _ := os.UserConfigDir()
+		ps, perr := profiles.NewStore(filepath.Join(storeDir, "RemoteAU"))
+		if perr == nil {
+			list, lerr := ps.List()
+			if lerr == nil {
+				if p, ok := profiles.ByName(list, profileName); ok {
+					logger.Infof("profile %q: preset=%s target=%dms", p.Name, p.Preset, p.TargetMs)
+				} else {
+					return fmt.Errorf("profile %q not found", profileName)
+				}
+			}
+		}
+	}
+
 	host, err := engine.NewHost(engine.HostOptions{
 		Name:           name,
 		Store:          store,
@@ -65,6 +89,8 @@ func runServe(args []string, stdout, stderr io.Writer, backend audio.Backend, fo
 		DeviceSelector: deviceSelector,
 		Format:         format,
 		OnPairingCode:  pairingCode,
+		RecordDir:      recordDir,
+		RelayAddr:      relayAddr,
 		Logger:         logger,
 	})
 	if err != nil {
@@ -72,6 +98,9 @@ func runServe(args []string, stdout, stderr io.Writer, backend audio.Backend, fo
 	}
 
 	fmt.Fprintf(stdout, "serve: %s, %s, listening on %s\n", format, sourceName, addr)
+	if recordDir != "" {
+		fmt.Fprintf(stdout, "recording to %s\n", recordDir)
+	}
 	fmt.Fprintln(stdout, "Press Ctrl-C to stop.")
 	return host.Run(ctx)
 }

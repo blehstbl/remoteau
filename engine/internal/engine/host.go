@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"path/filepath"
 	"os"
 	"strings"
 	"sync"
@@ -50,6 +51,9 @@ type HostOptions struct {
 	// RelayAddr enables relay mode (Phase 12): register with this relay so
 	// receivers outside the LAN can reach us.
 	RelayAddr string
+	// RecordDir enables local recording of the captured stream (Phase 14):
+	// one WAV file per stream, written pre-volume into this directory.
+	RecordDir string
 	// PairingTimeout bounds each pairing exchange.
 	PairingTimeout time.Duration
 
@@ -427,6 +431,9 @@ type hostStream struct {
 
 	// Relay-mode media envelope (nil on direct connections).
 	sealer *relay.Sealer
+
+	// Optional local recording (Phase 14).
+	rec *audio.WAVWriter
 
 	// Codec/stream bookkeeping.
 	formatGen  uint32
@@ -833,9 +840,37 @@ func (h *Host) startStreamFor(st *hostStream, req protocolv2.Caps) (protocolv2.C
 		return protocolv2.Caps{}, 0, err
 	}
 
+	// Recording (Phase 14): one WAV per stream, named by peer + time.
+	if h.opts.RecordDir != "" {
+		peerID := st.sess.PeerID()
+		name := fmt.Sprintf("%s-%s.wav", st.name, time.Now().Format("20060102-150405"))
+		path := filepath.Join(h.opts.RecordDir, sanitizeFile(name))
+		if rec, rerr := audio.NewWAVWriter(path, int(caps.SampleRate), int(caps.Channels)); rerr == nil {
+			st.rec = rec
+			h.log.Infof("recording stream to %s", path)
+		} else {
+			h.log.Warnf("recording disabled: %v", rerr)
+		}
+		_ = peerID
+	}
+
 	h.storeResumeState(st)
 	go h.sendLoop(st, caps, 0)
 	return caps, st.formatGen, nil
+}
+
+func sanitizeFile(name string) string {
+	out := make([]rune, 0, len(name))
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '-', r == '_', r == '.':
+			out = append(out, r)
+		default:
+			out = append(out, '_')
+		}
+	}
+	return string(out)
 }
 
 // codecConfigFromCaps maps wire caps to a codec config.
@@ -1050,8 +1085,12 @@ func (h *Host) sendLoop(st *hostStream, caps protocolv2.Caps, startSeq uint32) {
 	for {
 		select {
 		case <-ctx.Done():
-			// Persist the resume position before exiting.
+			// Persist the resume position and close the recording before exiting.
 			h.storeResumeState(st)
+			if st.rec != nil {
+				_ = st.rec.Close()
+				st.rec = nil
+			}
 			return
 		default:
 		}
@@ -1063,6 +1102,12 @@ func (h *Host) sendLoop(st *hostStream, caps protocolv2.Caps, startSeq uint32) {
 		}
 
 		src := buf[:n]
+		// Local recording (Phase 14): pre-volume copy of the system audio.
+		if st.rec != nil {
+			if rerr := st.rec.Write(buf[:n]); rerr != nil {
+				h.log.Debugf("record: %v", rerr)
+			}
+		}
 		for len(src) > 0 {
 			take := min(frameBytes-filled, len(src))
 			applyGain(chunk[filled:filled+take], src[:take], st.volume, st.muted)
@@ -1083,19 +1128,23 @@ func (h *Host) sendLoop(st *hostStream, caps protocolv2.Caps, startSeq uint32) {
 						continue
 					}
 				}
-	gen := st.formatGen
-	packet, err := protocolv2.AppendMedia(nil, protocolv2.Media{
-		StreamID:    0,
-		FormatGen:   uint16(gen),
-		Flags:       0,
-		Seq:         seq,
-		CaptureTsUs: captureFrame * uint64(1000000) / uint64(caps.SampleRate),
-		Payload:     wire,
-	})
+				gen := st.formatGen
+				packet, err := protocolv2.AppendMedia(nil, protocolv2.Media{
+					StreamID:    0,
+					FormatGen:   uint16(gen),
+					Flags:       0,
+					Seq:         seq,
+					CaptureTsUs: captureFrame * uint64(1000000) / uint64(caps.SampleRate),
+					Payload:     wire,
+				})
 				if err == nil {
 					if err := st.conn.SendMedia(packet); err != nil {
 						h.log.Debugf("send media: %v", err)
 						h.storeResumeState(st)
+						if st.rec != nil {
+							_ = st.rec.Close()
+							st.rec = nil
+						}
 						return
 					}
 				}
