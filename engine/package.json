@@ -1,0 +1,42 @@
+{
+  "name": "@leaperone/remote-au",
+  "version": "0.0.0",
+  "description": "N→1 LAN audio aggregation CLI — multiple senders capture audio, one receiver mixes and plays it back. Go + miniaudio, UDP (default) / TCP, auto-discovery.",
+  "bin": {
+    "remote-au": "bin/remote-au",
+    "rau": "bin/remote-au"
+  },
+  "files": [
+    "bin/remote-au",
+    "scripts/postinstall.mjs"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "postinstall": "node scripts/postinstall.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/leaperone/remote-au.git"
+  },
+  "homepage": "https://github.com/leaperone/remote-au#readme",
+  "bugs": {
+    "url": "https://github.com/leaperone/remote-au/issues"
+  },
+  "license": "AGPL-3.0-or-later",
+  "author": "leaperone",
+  "keywords": [
+    "audio",
+    "lan",
+    "udp",
+    "mixer",
+    "cli",
+    "miniaudio",
+    "audiorelay",
+    "loopback"
+  ]
+}
