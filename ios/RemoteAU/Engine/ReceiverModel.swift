@@ -72,10 +72,13 @@ final class ReceiverModel: ObservableObject {
     // Network threads
     private var audioThread: Thread?
     private var discoveryThread: Thread?
+    private var finderThread: Thread?
     private var utilityTimer: DispatchSourceTimer?
     private var audioFD: Int32 = -1
     private var discoveryFD: Int32 = -1
+    private var finderFD: Int32 = -1
     private let running = Locked(false)
+    private let finderRunning = Locked(false)
     private let instanceID: [UInt8] = (0..<16).map { _ in UInt8.random(in: 0...255) }
 
     // Sender binding + watch state (guarded by senderLock).
@@ -146,6 +149,91 @@ final class ReceiverModel: ObservableObject {
         }
         setMainState(.idle)
         setMainListening(false)
+    }
+
+    /// Stops everything including the discovery responder and finder.
+    func stopAll() {
+        stop()
+        stopFinder()
+    }
+    // MARK: PC discovery (finder: broadcast queries, collect announces)
+
+    /// Starts the finder: broadcasts remote-au discovery queries and lists
+    /// answering PCs (v2 hosts via the type-3 announce; remote-au `recv`
+    /// hosts via the plain v1 announce).
+    func startFinder() {
+        guard finderRunning.value == false else { return }
+        finderRunning.withLock { $0 = true }
+
+        let t = Thread { [weak self] in
+            self?.runFinder()
+        }
+        t.name = "remoteau.finder"
+        t.qualityOfService = .utility
+        finderThread = t
+        t.start()
+    }
+
+    func stopFinder() {
+        guard finderRunning.value else { return }
+        finderRunning.withLock { $0 = false }
+        UDPSocket.closeSocket(finderFD)
+        finderFD = -1
+    }
+
+    private func runFinder() {
+        guard let fd = try? UDPSocket.openUDP(port: 0) else {
+            return
+        }
+        finderFD = fd
+
+        let targets = UDPSocket.broadcastTargets(ports: V1Packet.defaultDiscoveryPorts)
+        let query = V1Packet.encodeQuery(name: Self.deviceName())
+
+        var instances: [String: DiscoveredPeer] = [:]
+        var lastQuery: Double = 0
+        let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: 2048)
+        defer { buf.deallocate() }
+
+        while finderRunning.value {
+            let now = ProcessInfo.processInfo.systemUptime
+            if now - lastQuery >= 1.0 {
+                lastQuery = now
+                for target in targets {
+                    _ = UDPSocket.sendto(fd: fd, data: query, addr: target.addr, port: target.port)
+                }
+            }
+
+            if UDPSocket.pollRead(fd: fd, timeoutMs: 200) {
+                var fromAddr: in_addr_t = 0
+                var fromPort: UInt16 = 0
+                let n = UDPSocket.recvfrom(fd: fd, buffer: buf, bufferLen: 2048,
+                                           sender: &fromAddr, senderPort: &fromPort)
+                if n > 0 {
+                    var packet = [UInt8](repeating: 0, count: n)
+                    memcpy(&packet, buf, n)
+                    if let msg = V1Packet.decodeDiscovery(packet),
+                       msg.type == .announce || msg.type == .announceV2 {
+                        let a = msg.announce
+                        let key = a.instanceID.map { String(format: "%02x", $0) }.joined()
+                        let addrString = a.advertised.count == 4 && a.advertised != [0, 0, 0, 0]
+                            ? UDPSocket.ipv4String(bytes: a.advertised)
+                            : UDPSocket.ipv4String(fromAddr)
+                        instances[key] = DiscoveredPeer(
+                            name: a.name.isEmpty ? "PC" : a.name,
+                            address: addrString,
+                            port: a.tcpPort,
+                            protocolVersion: a.protoVersion == 0 ? 1 : Int(a.protoVersion),
+                            paired: false
+                        )
+                        let snapshot = Array(instances.values)
+                        DispatchQueue.main.async { [weak self] in
+                            self?.discoveredPeers = snapshot.sorted { $0.name < $1.name }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Drops the current sender binding but keeps listening (reconnect UX).

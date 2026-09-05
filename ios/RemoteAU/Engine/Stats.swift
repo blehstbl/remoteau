@@ -1,6 +1,6 @@
 import Foundation
 
-/// Aggregate receiver statistics snapshot for the UI (Phase 10 groundwork).
+/// Aggregate receiver statistics snapshot for the UI (Phase 10).
 /// All network-derived numbers are EWMA-smoothed in the engine layers.
 struct StatsSnapshot: Equatable {
     var bufferDepthMs: Double = 0
@@ -17,6 +17,11 @@ struct StatsSnapshot: Equatable {
     var bitrateKbps: Double = 0
     var outputRoute: String = ""
     var engineRunning: Bool = false
+    var codec: String = "pcm"
+    var driftRatio: Double = 1.0
+    var maxBurstLoss: Int = 0
+    var captureFrameRateHz: Double = 0
+    var rttMs: Double = 0
 
     /// Rough software-side latency estimate: buffering + one frame duration.
     /// The Bluetooth link adds more (not measurable from software alone).

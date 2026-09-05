@@ -128,6 +128,13 @@ func SetLogLevel(level string) {
 // spawning the engine goroutine. PinSource is consulted when pairing is
 // required.
 func Connect(hostAddr, deviceName string, pins RequestSource) error {
+	return ConnectWithCaps(hostAddr, deviceName, 0, 0, 0, 0, 0, false, false, 0, 0, pins)
+}
+
+// ConnectWithCaps is Connect with explicit codec preferences (0 = default;
+// codec: 0=PCM 1=Opus). The reconnect loop is always enabled.
+func ConnectWithCaps(hostAddr, deviceName string, codecID, rate, channels, frameMs, bitrate int,
+	fec, dtx bool, complexity, appID int, pins RequestSource) error {
 	mu.Lock()
 	if running {
 		mu.Unlock()
@@ -152,6 +159,26 @@ func Connect(hostAddr, deviceName string, pins RequestSource) error {
 	setState("connecting")
 	ctx, ctxCancel := context.WithCancel(context.Background())
 	cancel = ctxCancel
+
+	requested := protocolv2.Caps{
+		Codec:       uint8(clampInt(codecID, 0, 1)),
+		SampleRate:  uint32(clampInt(rate, 0, 192000)),
+		Channels:    uint8(clampInt(channels, 0, 8)),
+		FrameMs:     uint8(clampInt(frameMs, 0, 20)),
+		OpusBitrate: uint32(clampInt(bitrate, 0, 510000)),
+		FEC:         boolBit(fec),
+		DTX:         boolBit(dtx),
+		Complexity:  uint8(clampInt(complexity, 0, 10)),
+		AppID:       uint8(clampInt(appID, 0, 2)),
+	}
+	if requested.SampleRate == 0 {
+		requested = protocolv2.Caps{
+			Codec:      protocolv2.CodecPCMS16LE,
+			SampleRate: 48000,
+			Channels:   2,
+			FrameMs:    5,
+		}
+	}
 
 	go func() {
 		defer func() {
@@ -183,13 +210,12 @@ func Connect(hostAddr, deviceName string, pins RequestSource) error {
 					s.OnMedia(pcm)
 				}
 			},
-			RequestedCaps: protocolv2.Caps{
-				Codec:      protocolv2.CodecPCMS16LE,
-				SampleRate: 48000,
-				Channels:   2,
-				FrameMs:    5,
+			OnState: func(state string) {
+				setState(state)
 			},
-			Logger: log,
+			RequestedCaps: requested,
+			Reconnect:     true,
+			Logger:        log,
 		})
 		if err != nil {
 			fail(err)
@@ -199,7 +225,6 @@ func Connect(hostAddr, deviceName string, pins RequestSource) error {
 		client = c
 		mu.Unlock()
 
-		setState("streaming")
 		runErr := c.Run(ctx)
 		if runErr != nil && ctx.Err() == nil && !errors.Is(runErr, context.Canceled) {
 			fail(runErr)
@@ -251,6 +276,23 @@ func PeerList() string {
 	}
 	out, _ := json.Marshal(peers)
 	return string(out)
+}
+
+func clampInt(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+func boolBit(b bool) uint8 {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // ForgetPeer removes a paired device by ID (hex 32 chars).

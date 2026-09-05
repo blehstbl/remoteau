@@ -127,4 +127,68 @@ enum UDPSocket {
         inet_ntop(AF_INET, &a, &buf, socklen_t(INET_ADDRSTRLEN))
         return String(cString: buf)
     }
+
+    static func ipv4String(bytes b: [UInt8]) -> String {
+        guard b.count == 4 else { return "0.0.0.0" }
+        return "\(b[0]).\(b[1]).\(b[2]).\(b[3])"
+    }
+
+    /// Discovery broadcast targets: loopback, global broadcast and every
+    /// interface's directed broadcast address (mirrors remote-au's targets).
+    static func broadcastTargets(ports: [UInt16]) -> [(addr: in_addr_t, port: UInt16)] {
+        var addrs: [in_addr_t] = []
+        var seen = Set<in_addr_t>()
+        func add(_ a: in_addr_t) {
+            if seen.insert(a).inserted {
+                addrs.append(a)
+            }
+        }
+        add(0x0100007F) // 127.0.0.1 (network order)
+        add(0xFFFFFFFF) // 255.255.255.255
+        for a in interfaceBroadcastAddrs() {
+            add(a)
+        }
+
+        var out: [(addr: in_addr_t, port: UInt16)] = []
+        for p in ports {
+            for a in addrs {
+                out.append((a, p))
+            }
+        }
+        return out
+    }
+
+    /// Directed broadcast addresses of up interfaces (network order).
+    static func interfaceBroadcastAddrs() -> [in_addr_t] {
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return [] }
+        defer { freeifaddrs(ifaddr) }
+
+        var out: [in_addr_t] = []
+        var cursor: UnsafeMutablePointer<ifaddrs>? = first
+        while let ptr = cursor {
+            let ifa = ptr.pointee
+            if let sa = ifa.ifa_addr, sa.pointee.sa_family == sa_family_t(AF_INET),
+               let maskPtr = ifa.ifa_netmask {
+                let sin = sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+                let mask = maskPtr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+                let ip = sin.sin_addr.s_addr
+                let m = mask.sin_addr.s_addr
+                // Directed broadcast = ip | ~mask, computed byte-wise (the
+                // values are in network order).
+                var broadcast: in_addr_t = 0
+                for i in 0..<4 {
+                    let ipB = UInt8(truncatingIfNeeded: ip >> UInt32(i * 8))
+                    let mB = UInt8(truncatingIfNeeded: m >> UInt32(i * 8))
+                    broadcast |= in_addr_t(UInt32(ipB | ~mB)) << UInt32(i * 8)
+                }
+                // Skip loopback broadcasts.
+                if (broadcast & 0xFF) != 127 {
+                    out.append(broadcast)
+                }
+            }
+            cursor = ptr.pointee.ifa_next
+        }
+        return out
+    }
 }

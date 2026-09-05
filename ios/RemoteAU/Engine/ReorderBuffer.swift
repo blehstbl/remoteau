@@ -37,6 +37,11 @@ final class ReorderBuffer {
     private(set) var packetsSeen: UInt64 = 0
     private(set) var arrivalJitterMs: Double = 0
     private(set) var lossPercent: Double = 0
+    private(set) var burstLoss: Int = 0
+    private(set) var maxBurstLoss: Int = 0
+    private(set) var captureFrameRateHz: Double = 0
+    private var lastCaptureFrame: UInt64 = 0
+    private var lastCaptureArrival: Double = 0
 
     private var lastArrival: Double = 0
     private var lastFlush: Double = 0
@@ -133,6 +138,24 @@ final class ReorderBuffer {
         } else {
             nextSeq = seq &+ UInt64(frames)
         }
+        // A good frame ends any loss burst.
+        burstLoss = 0
+        sinkWrite(payload)
+        trackCaptureFrame(seq, frames)
+    }
+
+    private func trackCaptureFrame(_ captureFrame: UInt64, _ frames: Int) {
+        let now = ProcessInfo.processInfo.systemUptime
+        if lastCaptureArrival > 0 {
+            let dt = now - lastCaptureArrival
+            if dt > 0.001, captureFrame > lastCaptureFrame {
+                let hz = Double(captureFrame - lastCaptureFrame) / dt
+                captureFrameRateHz += 0.2 * (hz - captureFrameRateHz)
+            }
+        }
+        lastCaptureFrame = captureFrame &+ UInt64(frames)
+        lastCaptureArrival = now
+    }
         write(payload)
     }
 
@@ -173,6 +196,10 @@ final class ReorderBuffer {
         concealedFrames += UInt64(frames)
         lossPackets += 1
         nudgeLoss(1.0)
+        burstLoss += 1
+        if burstLoss > maxBurstLoss {
+            maxBurstLoss = burstLoss
+        }
 
         ensureLastSample()
         let channels = lastSample.count
@@ -215,5 +242,10 @@ final class ReorderBuffer {
         arrivalJitterMs = 0
         lastArrival = 0
         lastFlush = 0
+        burstLoss = 0
+        maxBurstLoss = 0
+        captureFrameRateHz = 0
+        lastCaptureFrame = 0
+        lastCaptureArrival = 0
     }
 }
