@@ -1,0 +1,162 @@
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"remote-au/internal/audio"
+	"remote-au/internal/engine"
+	"remote-au/internal/logging"
+	"remote-au/internal/pairing"
+	"remote-au/internal/protocol/v2"
+	"remote-au/internal/transport"
+)
+
+// runServe hosts the v2 engine: QUIC + datagrams, pairing, discovery.
+func runServe(args []string, stdout, stderr io.Writer, backend audio.Backend, format audio.Format, logger logging.Logger) error {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	addr := fmt.Sprintf(":%d", 47010)
+	sourceName := "loopback"
+	deviceSelector := ""
+	name := defaultHostname()
+	fs.StringVar(&addr, "addr", addr, "v2 listen address")
+	fs.StringVar(&sourceName, "source", sourceName, "capture source: mic or loopback")
+	fs.StringVar(&deviceSelector, "device", deviceSelector, "capture device selector (see devices)")
+	fs.StringVar(&name, "name", name, "host name shown to receivers")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("serve takes no positional arguments: %v", fs.Args())
+	}
+
+	source, err := parseCaptureSource(sourceName)
+	if err != nil {
+		return err
+	}
+
+	store, err := pairing.NewWindowsStore()
+	if err != nil {
+		return fmt.Errorf("open trust store: %w", err)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	pairingCode := func(code string) {
+		fmt.Fprintf(stdout, "\n*** PAIRING: enter code %s on the device ***\n\n", code)
+	}
+
+	host, err := engine.NewHost(engine.HostOptions{
+		Name:           name,
+		Store:          store,
+		Backend:        backend,
+		ListenAddr:     addr,
+		CaptureSource:  source,
+		DeviceSelector: deviceSelector,
+		Format:         format,
+		OnPairingCode:  pairingCode,
+		Logger:         logger,
+	})
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(stdout, "serve: %s, %s, listening on %s\n", format, sourceName, addr)
+	fmt.Fprintln(stdout, "Press Ctrl-C to stop.")
+	return host.Run(ctx)
+}
+
+// runRecv2 is the v2 test client (desktop): connects to a v2 host, pairs,
+// and plays the received stream locally.
+func runRecv2(args []string, stdout, stderr io.Writer, backend audio.Backend, format audio.Format, logger logging.Logger) error {
+	fs := flag.NewFlagSet("recv2", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	hostAddr := ""
+	name := defaultHostname()
+	playbackSelector := ""
+	fs.StringVar(&hostAddr, "to", hostAddr, "host address, e.g. 192.168.1.10:47010")
+	fs.StringVar(&name, "name", name, "client name shown to the host")
+	fs.StringVar(&playbackSelector, "device", playbackSelector, "playback device selector (see devices)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("recv2 takes no positional arguments: %v", fs.Args())
+	}
+	if hostAddr == "" {
+		return fmt.Errorf("recv2 requires --to <host:port>")
+	}
+
+	store, err := pairing.NewWindowsStore()
+	if err != nil {
+		return fmt.Errorf("open trust store: %w", err)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// Jitter playback: pull from a bounded ring fed by OnMedia.
+	ring := audio.NewRing(48_000*4, 4) // 500ms @48k stereo
+	pull := func(out []byte, frames uint32) int {
+		n := ring.Read(out)
+		if n < len(out) {
+			clear(out[n:])
+			n = len(out)
+		}
+		return n
+	}
+
+	playbackOpts := audio.PlaybackOptions{Format: format, Pull: pull}
+	if playbackSelector != "" {
+		playbackOpts.DeviceSelector = playbackSelector
+	}
+	playback, err := backend.OpenPlayback(playbackOpts)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = playback.Close() }()
+	if err := playback.Start(); err != nil {
+		return err
+	}
+
+	client, err := engine.NewClient(engine.ClientOptions{
+		HostAddr: hostAddr,
+		Name:     name,
+		Store:    store,
+		PINProvider: func() (string, error) {
+			fmt.Fprint(stdout, "Enter the pairing code shown on the PC: ")
+			var code string
+			if _, err := fmt.Fscanln(os.Stdin, &code); err != nil {
+				return "", err
+			}
+			return code, nil
+		},
+		OnMedia: func(pcm []byte) {
+			ring.TryWrite(pcm)
+		},
+		RequestedCaps: protocolv2.Caps{
+			Codec:      protocolv2.CodecPCMS16LE,
+			SampleRate: uint32(format.Rate),
+			Channels:   uint8(format.Channels),
+			FrameMs:    5,
+		},
+		Logger: logger,
+	})
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(stdout, "recv2: connecting to %s\n", hostAddr)
+	return client.Run(ctx)
+}
+
+var _ = transport.TransportUDP
+var _ = time.Second
