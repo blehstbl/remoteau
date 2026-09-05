@@ -1,0 +1,50 @@
+name: RemoteAU
+options:
+  bundleIdPrefix: dev.remoteau
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: ""
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+targets:
+  RemoteAU:
+    type: application
+    platform: iOS
+    sources:
+      - path: RemoteAU
+    info:
+      path: RemoteAU/Info.plist
+      properties:
+        CFBundleDisplayName: RemoteAU
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UIBackgroundModes:
+          - audio
+        NSLocalNetworkUsageDescription:
+          RemoteAU needs local network access to find and stream audio from
+          your PC on the same Wi-Fi.
+        NSBonjourServices:
+          - _remoteau._tcp
+        UIUserInterfaceStyle: Automatic
+        ITSAppUsesNonExemptEncryption: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.remoteau.app
+        INFOPLIST_KEY_UIBackgroundModes: audio
+schemes:
+  RemoteAU:
+    build:
+      targets:
+        RemoteAU: all
+    run:
+      config: Debug

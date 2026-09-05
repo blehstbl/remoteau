@@ -1,0 +1,11 @@
+.DS_Store
+build/
+*.xcarchive
+*.ipa
+DerivedData/
+*.xcodeproj
+xcuserdata/
+.testbin/
+bin/
+vendor/
+

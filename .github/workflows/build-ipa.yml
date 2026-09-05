@@ -1,0 +1,43 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "ios/**"
+      - ".github/workflows/build-ipa.yml"
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate project
+        working-directory: ios
+        run: xcodegen generate
+
+      - name: Archive (unsigned)
+        working-directory: ios
+        run: |
+          xcodebuild -project RemoteAU.xcodeproj -scheme RemoteAU \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -archivePath build/RemoteAU.xcarchive archive \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY=""
+
+      - name: Package unsigned IPA
+        working-directory: ios
+        run: |
+          mkdir -p build/Payload
+          cp -R "build/RemoteAU.xcarchive/Products/Applications/RemoteAU.app" build/Payload/
+          cd build && rm -f RemoteAU.ipa && zip -qry RemoteAU.ipa Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: RemoteAU-unsigned-ipa
+          path: ios/build/RemoteAU.ipa
