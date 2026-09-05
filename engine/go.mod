@@ -9,6 +9,11 @@ require (
 )
 
 require (
+	fyne.io/systray v1.12.2 // indirect
+	github.com/godbus/dbus/v5 v5.1.0 // indirect
+)
+
+require (
 	golang.org/x/crypto v0.56.0
 	golang.org/x/net v0.57.0 // indirect
 )
