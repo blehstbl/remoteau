@@ -72,23 +72,21 @@ jobs:
           test -f "$OUT/sim/lib/pkgconfig/opus.pc"
 
       - name: Build RemoteAU.xcframework (gomobile, Opus)
+        working-directory: engine
         run: |
           set -eo pipefail
           export PATH="$PATH:$(go env GOPATH)/bin"
           go install golang.org/x/mobile/cmd/gomobile@latest
           go install golang.org/x/mobile/cmd/gobind@latest
           gomobile init
-          mkdir -p ios/Frameworks build
-
-          # The Go module lives in engine/, so run gomobile from there.
-          cd engine
+          mkdir -p "$GITHUB_WORKSPACE/ios/Frameworks" "$GITHUB_WORKSPACE/build"
 
           # Device slice: cgo flags point at the device libopus.
           PKG_CONFIG_PATH="$GITHUB_WORKSPACE/opus-ios/device/lib/pkgconfig" \
           CGO_CFLAGS="-I$GITHUB_WORKSPACE/opus-ios/device/include/opus" \
           CGO_LDFLAGS="-L$GITHUB_WORKSPACE/opus-ios/device/lib -lopus" \
           gomobile bind -target ios \
-            -o ../build/RemoteAU-ios.xcframework -prefix RemoteAU \
+            -o "$GITHUB_WORKSPACE/build/RemoteAU-ios.xcframework" -prefix RemoteAU \
             -tags "opus,nolibopusfile" ./mobile
 
           # Simulator slice: cgo flags point at the merged simulator libopus.
@@ -96,12 +94,11 @@ jobs:
           CGO_CFLAGS="-I$GITHUB_WORKSPACE/opus-ios/sim/include/opus" \
           CGO_LDFLAGS="-L$GITHUB_WORKSPACE/opus-ios/sim/lib -lopus" \
           gomobile bind -target iossimulator \
-            -o ../build/RemoteAU-sim.xcframework -prefix RemoteAU \
+            -o "$GITHUB_WORKSPACE/build/RemoteAU-sim.xcframework" -prefix RemoteAU \
             -tags "opus,nolibopusfile" ./mobile
 
-          cd ..
-
           # Combine into one xcframework (proper Info.plist written by Xcode).
+          cd "$GITHUB_WORKSPACE"
           DEV_FW=$(find build/RemoteAU-ios.xcframework -maxdepth 2 -name RemoteAU.framework)
           SIM_FW=$(find build/RemoteAU-sim.xcframework -maxdepth 2 -name RemoteAU.framework)
           rm -rf ios/Frameworks/RemoteAU.xcframework
