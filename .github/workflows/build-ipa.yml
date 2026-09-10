@@ -102,6 +102,12 @@ jobs:
           name: RemoteAU-xcframework
           path: ios/Frameworks/RemoteAU.xcframework
 
+      - name: Upload device libopus
+        uses: actions/upload-artifact@v4
+        with:
+          name: libopus-device
+          path: opus-ios/device/lib/libopus.a
+
   build:
     needs: framework
     runs-on: macos-15
@@ -113,6 +119,12 @@ jobs:
         with:
           name: RemoteAU-xcframework
           path: ios/Frameworks/RemoteAU.xcframework
+
+      - name: Download libopus (framework leaves these symbols undefined)
+        uses: actions/download-artifact@v4
+        with:
+          name: libopus-device
+          path: ios/Frameworks
 
       - name: Enable v2 in project
         run: python3 scripts/add-v2-dep.py
