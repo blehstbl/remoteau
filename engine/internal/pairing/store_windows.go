@@ -174,9 +174,9 @@ func dpapiProtect(plain []byte) ([]byte, error) {
 		return nil, fmt.Errorf("CryptProtectData failed")
 	}
 	defer LocalFree(out.pbData)
-outBytes := make([]byte, out.cbData)
-copy(outBytes, unsafe.Slice(out.pbData, out.cbData))
-return outBytes, nil
+	outBytes := make([]byte, out.cbData)
+	copy(outBytes, unsafe.Slice(out.pbData, out.cbData))
+	return outBytes, nil
 }
 
 func dpapiUnprotect(blob []byte) ([]byte, error) {
@@ -210,4 +210,3 @@ func LocalFree(p *byte) {
 	proc := kernel32.NewProc("LocalFree")
 	proc.Call(uintptr(unsafe.Pointer(p)))
 }
-

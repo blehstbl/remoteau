@@ -2,11 +2,11 @@ package engine
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
-	"encoding/hex"
-	"strings"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -86,9 +86,9 @@ type Client struct {
 	helloDone bool
 
 	// Ping round-trip via the control handler (single-reader discipline).
-	pingMu     sync.Mutex
-	pingNext   uint32
-	pending    map[uint32]chan uint64
+	pingMu   sync.Mutex
+	pingNext uint32
+	pending  map[uint32]chan uint64
 
 	// Live stats snapshot for UIs.
 	statsMu      sync.Mutex

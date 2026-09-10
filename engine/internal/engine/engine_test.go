@@ -16,10 +16,10 @@ import (
 
 // memoryStore is an in-memory pairing.Store for tests.
 type memoryStore struct {
-	mu   sync.Mutex
-	id   *pairing.Identity
-	set  bool
-	err  error
+	mu    sync.Mutex
+	id    *pairing.Identity
+	set   bool
+	err   error
 	peers []pairing.PeerRecord
 }
 
@@ -277,28 +277,37 @@ func TestMultiReceiverFanout(t *testing.T) {
 		return ch, cancel, errCh
 	}
 
-	aCh, aCancel, aErr := start("CLIENT-A")
-	bCh, bCancel, bErr := start("CLIENT-B")
-	defer aCancel()
-	defer bCancel()
-
-	got := 0
-	deadline := time.After(10 * time.Second)
-	for got < 2 {
+	// Pair/connect one client at a time: the host serializes pairings and
+	// shows a single code, so a shared PIN channel must not race. Both
+	// clients then stay connected simultaneously (the fanout assertion).
+	waitMedia := func(name string, ch chan []byte, errCh chan error) {
 		select {
-		case <-aCh:
-			got++
-		case <-bCh:
-			got++
-		case err := <-aErr:
-			t.Fatalf("client A: %v", err)
-		case err := <-bErr:
-			t.Fatalf("client B: %v", err)
-		case <-deadline:
-			t.Fatalf("only %d client(s) received media", got)
+		case <-ch:
+		case err := <-errCh:
+			t.Fatalf("client %s: %v", name, err)
+		case <-time.After(10 * time.Second):
+			t.Fatalf("client %s received no media", name)
 		}
 	}
+
+	aCh, aCancel, aErr := start("CLIENT-A")
+	defer aCancel()
+	waitMedia("A", aCh, aErr)
+
+	bCh, bCancel, bErr := start("CLIENT-B")
+	defer bCancel()
+	waitMedia("B", bCh, bErr)
+
+	// Both are connected now: assert A still receives audio alongside B.
+	select {
+	case <-aCh:
+	case err := <-aErr:
+		t.Fatalf("client A after B joined: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("client A stopped receiving after client B joined")
+	}
 }
+
 func TestSessionPingRoundTrip(t *testing.T) {
 	addr := "127.0.0.1:47112"
 	hostStore := &memoryStore{}

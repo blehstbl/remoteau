@@ -54,7 +54,7 @@ type Decision struct {
 	ExpectedLoss int // opus encoder packet-loss percentage
 	// SwitchToPCM/SwitchToOpus are hints used only in Auto mode when both
 	// codecs are negotiated. Zero values mean "keep current codec".
-	SwitchToPCM bool
+	SwitchToPCM  bool
 	SwitchToOpus bool
 	Level        Level
 }
@@ -69,16 +69,16 @@ type Controller struct {
 	cooldown   time.Duration
 
 	// State.
-	bitrate     int
-	fec         bool
+	bitrate      int
+	fec          bool
 	expectedLoss int
-	lastAdjust  time.Time
-	lossEWMA    float64
-	lateEWMA    float64
-	jitterEWMA  float64
-	rttEWMA     float64
-	underrunAcc uint64
-	initialized bool
+	lastAdjust   time.Time
+	lossEWMA     float64
+	lateEWMA     float64
+	jitterEWMA   float64
+	rttEWMA      float64
+	underrunAcc  uint64
+	initialized  bool
 }
 
 // NewController creates a controller. bitrates are clamped to sane Opus
@@ -95,10 +95,10 @@ func NewController(minBitrate, maxBitrate int) *Controller {
 	}
 	start := (minBitrate + maxBitrate) / 2
 	return &Controller{
-		minBitrate:  minBitrate,
-		maxBitrate:  maxBitrate,
-		cooldown:    2 * time.Second,
-		bitrate:     start,
+		minBitrate:   minBitrate,
+		maxBitrate:   maxBitrate,
+		cooldown:     2 * time.Second,
+		bitrate:      start,
 		expectedLoss: 0,
 	}
 }

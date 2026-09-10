@@ -104,8 +104,8 @@ type fakeBackend struct {
 	lists audio.DeviceLists
 }
 
-func (f *fakeBackend) Name() string                    { return "fake" }
-func (f *fakeBackend) SupportsLoopback() bool          { return true }
+func (f *fakeBackend) Name() string           { return "fake" }
+func (f *fakeBackend) SupportsLoopback() bool { return true }
 func (f *fakeBackend) EnumerateDevices() (audio.DeviceLists, error) {
 	return f.lists, nil
 }

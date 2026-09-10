@@ -10,27 +10,27 @@ import (
 
 // Control message types.
 const (
-	MsgHello        uint16 = 0x0001
-	MsgHelloOK      uint16 = 0x0002
-	MsgPairBegin    uint16 = 0x0010
+	MsgHello         uint16 = 0x0001
+	MsgHelloOK       uint16 = 0x0002
+	MsgPairBegin     uint16 = 0x0010
 	MsgPairChallenge uint16 = 0x0011
-	MsgPairConfirm  uint16 = 0x0012
-	MsgPairResult   uint16 = 0x0013
-	MsgStreamStart  uint16 = 0x0020
-	MsgStreamAck    uint16 = 0x0021
-	MsgStreamStop   uint16 = 0x0022
-	MsgFormatUpdate uint16 = 0x0030
-	MsgFormatAck    uint16 = 0x0031
-	MsgStats        uint16 = 0x0040
-	MsgStatsAck     uint16 = 0x0041
-	MsgVolume       uint16 = 0x0050
-	MsgPing         uint16 = 0x0060
-	MsgPong         uint16 = 0x0061
-	MsgResume       uint16 = 0x0070
-	MsgResumeOK     uint16 = 0x0071
-	MsgQualityMode  uint16 = 0x0080
-	MsgSetSource    uint16 = 0x0081
-	MsgSetSourceAck uint16 = 0x0082
+	MsgPairConfirm   uint16 = 0x0012
+	MsgPairResult    uint16 = 0x0013
+	MsgStreamStart   uint16 = 0x0020
+	MsgStreamAck     uint16 = 0x0021
+	MsgStreamStop    uint16 = 0x0022
+	MsgFormatUpdate  uint16 = 0x0030
+	MsgFormatAck     uint16 = 0x0031
+	MsgStats         uint16 = 0x0040
+	MsgStatsAck      uint16 = 0x0041
+	MsgVolume        uint16 = 0x0050
+	MsgPing          uint16 = 0x0060
+	MsgPong          uint16 = 0x0061
+	MsgResume        uint16 = 0x0070
+	MsgResumeOK      uint16 = 0x0071
+	MsgQualityMode   uint16 = 0x0080
+	MsgSetSource     uint16 = 0x0081
+	MsgSetSourceAck  uint16 = 0x0082
 	MsgReceiverState uint16 = 0x0083
 )
 
@@ -39,15 +39,15 @@ const (
 //	codec u8 | sampleRate u32 | channels u8 | frameMs u8 |
 //	opusBitrate u32 | fec u8 | dtx u8 | complexity u8 | appID u8
 type Caps struct {
-	Codec      uint8  // 0=PCM_S16LE 1=Opus
-	SampleRate uint32
-	Channels   uint8
-	FrameMs    uint8
+	Codec       uint8 // 0=PCM_S16LE 1=Opus
+	SampleRate  uint32
+	Channels    uint8
+	FrameMs     uint8
 	OpusBitrate uint32
-	FEC        uint8
-	DTX        uint8
-	Complexity uint8
-	AppID      uint8 // 0=audio 1=voip 2=lowdelay
+	FEC         uint8
+	DTX         uint8
+	Complexity  uint8
+	AppID       uint8 // 0=audio 1=voip 2=lowdelay
 }
 
 // Codec identifiers.
@@ -58,9 +58,9 @@ const (
 
 // Opus application identifiers.
 const (
-	OpusAppAudio       uint8 = 0
-	OpusAppVoIP        uint8 = 1
-	OpusAppLowDelay    uint8 = 2
+	OpusAppAudio    uint8 = 0
+	OpusAppVoIP     uint8 = 1
+	OpusAppLowDelay uint8 = 2
 )
 
 // 15 bytes total.
@@ -87,7 +87,7 @@ func DecodeCaps(b []byte) (Caps, error) {
 		OpusBitrate: binary.LittleEndian.Uint32(b[7:11]),
 		FEC:         b[11],
 		DTX:         b[12],
-		Complexity:  b[12 + 1],
+		Complexity:  b[12+1],
 		AppID:       b[14],
 	}, nil
 }
@@ -197,13 +197,13 @@ type FormatAck struct {
 }
 
 type Stats struct {
-	LossPct      uint16   // ×100 (0..10000)
-	LatePct      uint16   // ×100
-	JitterUs     uint32
-	RTTUs        uint32
-	BufDepthMs   uint16
-	Underruns    uint32
-	DriftPpm     int32
+	LossPct    uint16 // ×100 (0..10000)
+	LatePct    uint16 // ×100
+	JitterUs   uint32
+	RTTUs      uint32
+	BufDepthMs uint16
+	Underruns  uint32
+	DriftPpm   int32
 }
 
 type Volume struct {

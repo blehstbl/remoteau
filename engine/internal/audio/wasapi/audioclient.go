@@ -35,8 +35,8 @@ type waveFormat struct {
 }
 
 const (
-	waveFormatPCM       = 0x0001
-	waveFormatIEEEFloat = 0x0003
+	waveFormatPCM        = 0x0001
+	waveFormatIEEEFloat  = 0x0003
 	waveFormatExtensible = 0xFFFE
 )
 

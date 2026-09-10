@@ -22,8 +22,8 @@ import (
 type Role int
 
 const (
-	RoleHost Role = iota // Windows: produces audio
-	RoleClient           // iPhone: consumes audio
+	RoleHost   Role = iota // Windows: produces audio
+	RoleClient             // iPhone: consumes audio
 )
 
 // Errors surfaced to callers for UI handling.
@@ -40,11 +40,11 @@ type Handler func(m protocolv2.Message)
 
 // Session runs the control protocol over an established transport conn.
 type Session struct {
-	conn  *transportv2.Conn
-	ctrl  *transportv2.ControlStream
-	br    *bufio.Reader
-	bw    *bufio.Writer
-	role  Role
+	conn *transportv2.Conn
+	ctrl *transportv2.ControlStream
+	br   *bufio.Reader
+	bw   *bufio.Writer
+	role Role
 
 	mu       sync.Mutex
 	handler  Handler
@@ -82,13 +82,13 @@ func New(conn *transportv2.Conn, role Role, localDeviceID [16]byte) (*Session, e
 		return nil, err
 	}
 	s := &Session{
-		conn:     conn,
-		ctrl:     ctrl,
-		br:       bufio.NewReader(ctrl.Raw()),
-		bw:       bufio.NewWriter(ctrl.Raw()),
-		role:     role,
-		closed:   make(chan struct{}),
-		localID:  localDeviceID,
+		conn:    conn,
+		ctrl:    ctrl,
+		br:      bufio.NewReader(ctrl.Raw()),
+		bw:      bufio.NewWriter(ctrl.Raw()),
+		role:    role,
+		closed:  make(chan struct{}),
+		localID: localDeviceID,
 	}
 	return s, nil
 }
@@ -270,7 +270,7 @@ func (s *Session) ExchangeHellos(ctx context.Context, name string, offered proto
 // interleave RESUME handling).
 func (s *Session) SendHello(name string, offered protocolv2.Caps) error {
 	return s.send(protocolv2.Message{
-		Type:    protocolv2.MsgHello,
+		Type: protocolv2.MsgHello,
 		Payload: protocolv2.AppendHello(nil, protocolv2.Hello{
 			ProtoVersion: protocolv2.Version,
 			MinProto:     protocolv2.Version,
@@ -315,7 +315,7 @@ func (s *Session) CompleteHello(m protocolv2.Message, offered protocolv2.Caps) (
 
 	// Host's own HELLO (device identity), then HELLO_OK.
 	if err := s.send(protocolv2.Message{
-		Type:    protocolv2.MsgHello,
+		Type: protocolv2.MsgHello,
 		Payload: protocolv2.AppendHello(nil, protocolv2.Hello{
 			ProtoVersion: protocolv2.Version,
 			MinProto:     protocolv2.Version,

@@ -14,16 +14,16 @@ import (
 )
 
 var (
-	ole32              = windows.NewLazySystemDLL("ole32.dll")
-	procCoInitializeEx = ole32.NewProc("CoInitializeEx")
-	procCoUninitialize = ole32.NewProc("CoUninitialize")
+	ole32                = windows.NewLazySystemDLL("ole32.dll")
+	procCoInitializeEx   = ole32.NewProc("CoInitializeEx")
+	procCoUninitialize   = ole32.NewProc("CoUninitialize")
 	procCoCreateInstance = ole32.NewProc("CoCreateInstance")
-	procCoTaskMemFree  = ole32.NewProc("CoTaskMemFree")
+	procCoTaskMemFree    = ole32.NewProc("CoTaskMemFree")
 )
 
 const (
-	clsCtxAll        = 0x17 // CLSCTX_ALL
-	coinitMultithreded = 0x0
+	clsCtxAll               = 0x17 // CLSCTX_ALL
+	coinitMultithreded      = 0x0
 	coinitApartmentThreaded = 0x2
 )
 

@@ -430,4 +430,3 @@ func TestSetupWithKeychainAndMigrate(t *testing.T) {
 		t.Fatal("legacy file deleted even though source was not empty")
 	}
 }
-

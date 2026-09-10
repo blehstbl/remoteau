@@ -12,8 +12,8 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	"path/filepath"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -82,9 +82,9 @@ type HostOptions struct {
 
 // Host is the v2 audio host.
 type Host struct {
-	opts   HostOptions
-	log    logging.Logger
-	id     *pairing.Identity
+	opts    HostOptions
+	log     logging.Logger
+	id      *pairing.Identity
 	trusted map[string]bool // peer fingerprint -> paired
 
 	mu      sync.Mutex
@@ -453,9 +453,9 @@ type hostStream struct {
 	seq atomic.Uint32
 
 	// Per-receiver output controls.
-	volume   float64 // 0..2, 1 = unity
-	muted    bool
-	fecBias  bool
+	volume  float64 // 0..2, 1 = unity
+	muted   bool
+	fecBias bool
 
 	// Receiver-selected control-plane state (Phase 15): the quality preset
 	// (QualityModeAuto on creation) and the receiver's reported lifecycle
@@ -1114,16 +1114,16 @@ func (h *Host) tryResume(sess *session.Session, conn *transportv2.Conn, payload 
 
 	streamCtx, cancel := context.WithCancel(context.Background())
 	st := &hostStream{
-		conn:      conn,
-		sess:      sess,
-		cancel:    cancel,
-		quality:   quality.NewController(32000, maxInt(h.opts.MaxBitrate, 256000)),
-		volume:    1.0,
-		name:      sess.PeerName(),
-		caps:      caps,
-		formatGen: formatGen,
+		conn:       conn,
+		sess:       sess,
+		cancel:     cancel,
+		quality:    quality.NewController(32000, maxInt(h.opts.MaxBitrate, 256000)),
+		volume:     1.0,
+		name:       sess.PeerName(),
+		caps:       caps,
+		formatGen:  formatGen,
 		pendingGen: formatGen,
-		sealer:    stSealer,
+		sealer:     stSealer,
 	}
 	st.seq.Store(nextSeq)
 	codecImpl, err := codec.New(codecConfigFromCaps(caps), h.log)
@@ -1576,8 +1576,6 @@ func generatePIN() string {
 	}
 	return string(b)
 }
-
-
 
 func opusAvailable() bool {
 	return codec.OpusAvailable()

@@ -52,11 +52,11 @@ var (
 	identity *pairing.Identity
 	store    pairing.Store
 
-	client   *engine.Client
-	cancel   context.CancelFunc
-	running  bool
-	state    = "idle"
-	lastErr  string
+	client  *engine.Client
+	cancel  context.CancelFunc
+	running bool
+	state   = "idle"
+	lastErr string
 
 	mediaSink MediaSink
 	stateSink StateSink

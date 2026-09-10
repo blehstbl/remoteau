@@ -250,7 +250,7 @@ func (cv *captureConverter) outputFrames(inFrames int) int {
 	if !cv.needsResample {
 		return inFrames
 	}
-	return int(float64(inFrames) * float64(cv.outRate) / float64(cv.inRate)) + 2
+	return int(float64(inFrames)*float64(cv.outRate)/float64(cv.inRate)) + 2
 }
 
 // convert converts `frames` frames at dataPtr into dst (S16LE), appending.

@@ -32,13 +32,13 @@ func NewWAVWriter(path string, rate, channels int) (*WAVWriter, error) {
 	putU32(hdr[4:], 36) // patched on close
 	copy(hdr[8:12], "WAVE")
 	copy(hdr[12:16], "fmt ")
-	putU32(hdr[16:], 16)                       // fmt chunk size
-	putU16(hdr[20:], 1)                        // PCM
-	putU16(hdr[22:], uint16(channels))         // channels
-	putU32(hdr[24:], uint32(rate))             // sample rate
-	putU32(hdr[28:], uint32(rate*channels*2))  // byte rate
-	putU16(hdr[32:], uint16(channels*2))       // block align
-	putU16(hdr[34:], 16)                       // bits
+	putU32(hdr[16:], 16)                      // fmt chunk size
+	putU16(hdr[20:], 1)                       // PCM
+	putU16(hdr[22:], uint16(channels))        // channels
+	putU32(hdr[24:], uint32(rate))            // sample rate
+	putU32(hdr[28:], uint32(rate*channels*2)) // byte rate
+	putU16(hdr[32:], uint16(channels*2))      // block align
+	putU16(hdr[34:], 16)                      // bits
 	copy(hdr[36:40], "data")
 	putU32(hdr[40:], 0) // patched on close
 

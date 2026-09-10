@@ -41,11 +41,11 @@ import (
 //     requesting more than one is rejected (API limitation, documented).
 
 var (
-	combase                              = windows.NewLazySystemDLL("combase.dll")
-	procActivateAudioInterfaceAsync      = combase.NewProc("ActivateAudioInterfaceAsync")
-	kernel32                             = windows.NewLazySystemDLL("kernel32.dll")
-	procOpenProcess                      = kernel32.NewProc("OpenProcess")
-	procQueryFullProcessImageNameW       = kernel32.NewProc("QueryFullProcessImageNameW")
+	combase                         = windows.NewLazySystemDLL("combase.dll")
+	procActivateAudioInterfaceAsync = combase.NewProc("ActivateAudioInterfaceAsync")
+	kernel32                        = windows.NewLazySystemDLL("kernel32.dll")
+	procOpenProcess                 = kernel32.NewProc("OpenProcess")
+	procQueryFullProcessImageNameW  = kernel32.NewProc("QueryFullProcessImageNameW")
 )
 
 // GUIDs (Windows SDK). iidIAudioClient lives in com.go.

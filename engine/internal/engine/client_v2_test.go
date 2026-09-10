@@ -17,10 +17,10 @@ import (
 // fakeCodec for clientMedia tests: frame = 8 bytes PCM; PLC emits 0xEE fill.
 type fakeCodec struct{}
 
-func (fakeCodec) Name() string       { return "fake" }
+func (fakeCodec) Name() string         { return "fake" }
 func (fakeCodec) Config() codec.Config { return codec.Config{FrameMs: 10} }
-func (fakeCodec) FrameBytes() int    { return 8 }
-func (fakeCodec) WireMTU() int       { return 64 }
+func (fakeCodec) FrameBytes() int      { return 8 }
+func (fakeCodec) WireMTU() int         { return 64 }
 
 func (fakeCodec) EncodeFrame(pcm []byte) ([]byte, error) {
 	out := make([]byte, len(pcm))
@@ -173,8 +173,13 @@ func TestClientResumeAfterReconnect(t *testing.T) {
 	mediaGot := make(chan struct{}, 1)
 	client2, err := NewClient(ClientOptions{
 		HostAddr: addr, Name: "RESUME-PHONE", Store: client.opts.Store,
-		OnMedia: func([]byte) { select { case mediaGot <- struct{}{}: default: } },
-		Logger:  loggingNop(),
+		OnMedia: func([]byte) {
+			select {
+			case mediaGot <- struct{}{}:
+			default:
+			}
+		},
+		Logger: loggingNop(),
 	})
 	if err != nil {
 		t.Fatalf("client2: %v", err)
@@ -324,4 +329,3 @@ func audioTestFormat() audio.Format {
 func loopbackSource() audio.Source { return audio.SourceLoopback }
 
 func loggingNop() logging.Logger { return logging.Nop() }
-

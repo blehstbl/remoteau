@@ -4,14 +4,14 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/hex"
-	"testing"
 	"os"
+	"testing"
 	"time"
 
-	"remote-au/internal/pairing"
-	"remote-au/internal/transport/v2"
 	"remote-au/internal/logging"
+	"remote-au/internal/pairing"
 	"remote-au/internal/relay"
+	"remote-au/internal/transport/v2"
 )
 
 // TestRelayEndToEnd: host and client connect through a relay splice; all
@@ -90,8 +90,13 @@ func TestRelayEndToEnd(t *testing.T) {
 		HostDeviceID: hex.EncodeToString(hostDeviceID[:]),
 		Name:         "RELAY-PHONE",
 		Store:        clientStore,
-		OnMedia:      func([]byte) { select { case mediaGot <- struct{}{}: default: } },
-		Logger:       debugTestLogger(),
+		OnMedia: func([]byte) {
+			select {
+			case mediaGot <- struct{}{}:
+			default:
+			}
+		},
+		Logger: debugTestLogger(),
 	})
 	if err != nil {
 		t.Fatalf("relay client: %v", err)
@@ -121,5 +126,5 @@ func debugTestLogger() logging.Logger {
 	l, _ := logging.New(os.Stderr, "debug", "text")
 	return l
 }
-var _ = os.Stderr
 
+var _ = os.Stderr

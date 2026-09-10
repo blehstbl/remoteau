@@ -19,6 +19,7 @@ import (
 
 	"remote-au/internal/pairing"
 )
+
 // CertFingerprint returns the SHA-256 fingerprint (hex) of a certificate's
 // raw DER.
 func CertFingerprint(cert *x509.Certificate) string {

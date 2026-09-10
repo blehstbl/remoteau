@@ -12,14 +12,14 @@ import (
 
 // Profile is one named streaming configuration.
 type Profile struct {
-	Name       string `json:"name"`
-	Preset     string `json:"preset"`       // auto | lowest | lossless | robust
-	TargetMs   int    `json:"target_ms"`    // receiver jitter target (advanced)
-	PreferOpus bool   `json:"prefer_opus"`  // v2 codec preference
-	BitrateKbps int   `json:"bitrate_kbps"` // v2 opus bitrate
-	FEC        bool   `json:"fec"`
-	DTX        bool   `json:"dtx"`
-	Relay      bool   `json:"relay"` // WAN mode
+	Name        string `json:"name"`
+	Preset      string `json:"preset"`       // auto | lowest | lossless | robust
+	TargetMs    int    `json:"target_ms"`    // receiver jitter target (advanced)
+	PreferOpus  bool   `json:"prefer_opus"`  // v2 codec preference
+	BitrateKbps int    `json:"bitrate_kbps"` // v2 opus bitrate
+	FEC         bool   `json:"fec"`
+	DTX         bool   `json:"dtx"`
+	Relay       bool   `json:"relay"` // WAN mode
 }
 
 // Defaults are the four profiles from the plan.

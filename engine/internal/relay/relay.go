@@ -43,13 +43,13 @@ func RunRelay(ctx context.Context, addr string, tlsCfg *tls.Config, logger Logge
 		logger("relay listening on " + addr)
 	}
 
-type half struct {
-	role byte // 'H' or 'P'
-	id   string
-	conn *transportv2.Conn
-	// paired is closed by the phone side when the splice begins.
-	paired chan struct{}
-}
+	type half struct {
+		role byte // 'H' or 'P'
+		id   string
+		conn *transportv2.Conn
+		// paired is closed by the phone side when the splice begins.
+		paired chan struct{}
+	}
 
 	waiting := make(map[string]*half) // keyed by hostDeviceID (phone side) or "H" (host side)
 	var mu sync.Mutex

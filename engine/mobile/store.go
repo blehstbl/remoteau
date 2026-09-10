@@ -23,7 +23,7 @@ type fileStore struct {
 }
 
 type fileState struct {
-	IdentityPKCS8 []byte             `json:"identity_pkcs8"`
+	IdentityPKCS8 []byte               `json:"identity_pkcs8"`
 	Peers         []pairing.PeerRecord `json:"peers"`
 }
 

@@ -30,11 +30,11 @@ const (
 	pinVerifyInfo  = "rau2-pin-verify-v1"
 	pairSecretInfo = "rau2-pairing-secret-v1"
 
-	tagLen     = 32
-	secretLen  = 32
-	pubLen     = 65
-	saltLen    = 16
-	nonceLen   = 16
+	tagLen    = 32
+	secretLen = 32
+	pubLen    = 65
+	saltLen   = 16
+	nonceLen  = 16
 )
 
 // ErrPinMismatch is returned when the PINs did not match.
@@ -44,8 +44,8 @@ var ErrPinMismatch = errors.New("pairing pin mismatch")
 type Role int
 
 const (
-	RoleSender Role = iota // the PC: displays the code
-	RoleReceiver           // the iPhone: user enters/confirms the code
+	RoleSender   Role = iota // the PC: displays the code
+	RoleReceiver             // the iPhone: user enters/confirms the code
 )
 
 // Exchange runs one side of a pairing exchange.
