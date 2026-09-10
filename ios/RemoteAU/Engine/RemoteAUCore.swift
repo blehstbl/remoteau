@@ -30,7 +30,7 @@ import RemoteAU
 import Security
 
 /// Bridges the Go engine callbacks into Swift.
-final class GoMediaSink: NSObject, RemoteAUMobileMediaSink {
+final class GoMediaSink: NSObject, RemoteAUMobileMediaSinkProtocol {
     let onPCM: ([UInt8]) -> Void
 
     init(onPCM: @escaping ([UInt8]) -> Void) {
@@ -43,7 +43,7 @@ final class GoMediaSink: NSObject, RemoteAUMobileMediaSink {
     }
 }
 
-final class GoStateSink: NSObject, RemoteAUMobileStateSink {
+final class GoStateSink: NSObject, RemoteAUMobileStateSinkProtocol {
     let onState: (String) -> Void
 
     init(onState: @escaping (String) -> Void) {
@@ -56,7 +56,7 @@ final class GoStateSink: NSObject, RemoteAUMobileStateSink {
     }
 }
 
-final class GoStatsSink: NSObject, RemoteAUMobileStatsSink {
+final class GoStatsSink: NSObject, RemoteAUMobileStatsSinkProtocol {
     let onStats: (String) -> Void
 
     init(onStats: @escaping (String) -> Void) {
@@ -71,7 +71,7 @@ final class GoStatsSink: NSObject, RemoteAUMobileStatsSink {
     }
 }
 
-final class GoPINSource: NSObject, RemoteAUMobileRequestSource {
+final class GoPINSource: NSObject, RemoteAUMobileRequestSourceProtocol {
     let get: () -> String
 
     init(get: @escaping () -> String) {
@@ -91,7 +91,7 @@ final class GoPINSource: NSObject, RemoteAUMobileRequestSource {
 /// Binding shapes assumed (consistent with GoMediaSink/GoPINSource above and
 /// the throwing RemoteAUMobile* calls): Go `[]byte` bridges to `Data?`, Go
 /// `error` surfaces as a Swift `throws`, and Go `GetX` becomes `getX`.
-final class KeychainTrust: NSObject, RemoteAUMobileStoreSource {
+final class KeychainTrust: NSObject, RemoteAUMobileStoreSourceProtocol {
     private static let service = "dev.remoteau.trust"
     private static let identityAccount = "identity"
     private static let peersAccount = "peers"
@@ -246,10 +246,10 @@ final class V2Controller: ObservableObject {
         // only runs while the Keychain is still empty, so the two compose.
         let trust = KeychainTrust()
         trust.migrateLegacyFile(dir: base)
-        do {
-            _ = try RemoteAUMobileSetupWithKeychainAndMigrate(trust, dir)
-        } catch {
-            lastError = error.localizedDescription
+        // gomobile C functions take the NSError out-param explicitly in Swift
+        // (they are not `throws`); the Bool result is the success flag.
+        if !RemoteAUMobileSetupWithKeychainAndMigrate(trust, dir, nil) {
+            lastError = "engine setup failed"
             return
         }
         trustStore = trust
@@ -292,21 +292,19 @@ final class V2Controller: ObservableObject {
         sink = s
         RemoteAUMobileSetMediaSink(s)
 
-        do {
-            if let adv = advanced {
-                _ = try RemoteAUMobileConnectWithCaps(
-                    host, name,
-                    adv.codecOpus ? 1 : 0,
-                    48000, 2, adv.frameMs, adv.bitrateKbps * 1000,
-                    adv.fec, adv.dtx, 5, 0,
-                    pinSource
-                )
-            } else {
-                _ = try RemoteAUMobileConnect(host, name, pinSource)
-            }
-        } catch {
-            lastError = error.localizedDescription
+        let ok: Bool
+        if let adv = advanced {
+            ok = RemoteAUMobileConnectWithCaps(
+                host, name,
+                adv.codecOpus ? 1 : 0,
+                48000, 2, adv.frameMs, adv.bitrateKbps * 1000,
+                adv.fec, adv.dtx, 5, 0,
+                pinSource, nil
+            )
+        } else {
+            ok = RemoteAUMobileConnect(host, name, pinSource, nil)
         }
+        if !ok { lastError = "connect failed" }
     }
 
     /// Starts streaming through the secure relay. `relayAddr` is the relay's
@@ -326,17 +324,14 @@ final class V2Controller: ObservableObject {
         RemoteAUMobileSetMediaSink(s)
 
         let adv = advanced ?? AdvancedSettings()
-        do {
-            _ = try RemoteAUMobileConnectViaRelay(
-                relayAddr, hostDeviceID, name,
-                adv.codecOpus ? 1 : 0,
-                48000, 2, adv.frameMs, adv.bitrateKbps * 1000,
-                adv.fec, adv.dtx, 5, 0,
-                pinSource
-            )
-        } catch {
-            lastError = error.localizedDescription
-        }
+        let ok = RemoteAUMobileConnectViaRelay(
+            relayAddr, hostDeviceID, name,
+            adv.codecOpus ? 1 : 0,
+            48000, 2, adv.frameMs, adv.bitrateKbps * 1000,
+            adv.fec, adv.dtx, 5, 0,
+            pinSource, nil
+        )
+        if !ok { lastError = "relay connect failed" }
     }
 
     func stop() {
@@ -347,24 +342,20 @@ final class V2Controller: ObservableObject {
     /// name, 2 = diagnostic test tone, 3 = per-app ("p:1,2" / "x:9").
     /// (Go `int` bridges to Swift `Int`, matching the other RemoteAUMobile caps.)
     func setSource(kind: Int, name: String) {
-        do {
-            _ = try RemoteAUMobileSetSource(kind, name)
-        } catch {
-            lastError = error.localizedDescription
+        if !RemoteAUMobileSetSource(kind, name, nil) {
+            lastError = "setting the capture source failed"
         }
     }
 
     /// Quality mode: 0 auto, 1 lowest, 2 lossless, 3 robust, 4 advanced.
     func setQualityMode(_ mode: Int) {
-        do {
-            _ = try RemoteAUMobileSetQualityMode(mode)
-        } catch {
-            lastError = error.localizedDescription
+        if !RemoteAUMobileSetQualityMode(mode, nil) {
+            lastError = "setting the quality mode failed"
         }
     }
 
     func forgetPeer(idHex: String) {
-        _ = try? RemoteAUMobileForgetPeer(idHex)
+        _ = RemoteAUMobileForgetPeer(idHex, nil)
         pairedPeers = RemoteAUMobilePeerList()
     }
 
