@@ -39,6 +39,16 @@ func TestControlPayloadRoundTrips(t *testing.T) {
 			},
 		},
 		{
+			name: "set source per-app",
+			append: func(dst []byte) []byte {
+				return AppendSetSource(dst, SetSource{Kind: SetSourcePerApp, Name: "p:123,456"})
+			},
+			decode: func(b []byte) (bool, error) {
+				got, err := DecodeSetSource(b)
+				return err == nil && got.Kind == SetSourcePerApp && got.Name == "p:123,456", err
+			},
+		},
+		{
 			name: "set source ack",
 			append: func(dst []byte) []byte {
 				return AppendSetSourceAck(dst, SetSourceAck{OK: 1, Detail: "source: Speakers"})
@@ -98,7 +108,7 @@ func TestControlPayloadsRejectInvalid(t *testing.T) {
 		},
 		{
 			name:   "set source unknown kind",
-			blob:   AppendSetSource(nil, SetSource{Kind: 3, Name: "x"}),
+			blob:   AppendSetSource(nil, SetSource{Kind: 4, Name: "x"}),
 			decode: func(b []byte) error { _, err := DecodeSetSource(b); return err },
 		},
 		{

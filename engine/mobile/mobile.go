@@ -2,6 +2,7 @@
 // gomobile bind. The Swift app drives it through the small API below:
 //
 //	Setup(dataDir)             — load/create identity + trust store
+//	SetupWithKeychain(source)  — same, backed by host secure storage
 //	Connect(host, name, pin)   — connect+pair+stream (async, non-blocking)
 //	Stop()                     — tear down
 //	LatestStats()              — JSON stats snapshot for the UI
@@ -49,7 +50,7 @@ var (
 
 	dataDir  string
 	identity *pairing.Identity
-	store    *fileStore
+	store    pairing.Store
 
 	client   *engine.Client
 	cancel   context.CancelFunc
@@ -98,6 +99,62 @@ func Setup(dir string) error {
 		}
 	}
 	identity = id
+	mu.Unlock()
+	setState("ready")
+	return nil
+}
+
+// SetupWithKeychain initializes the engine using the host-provided secure
+// trust store (Keychain on iOS) instead of the file-based store. Same
+// semantics as Setup: it loads the stored identity or creates a fresh one and
+// leaves the engine ready. Safe to call more than once (re-setup reuses the
+// stored identity; nothing is duplicated).
+func SetupWithKeychain(source StoreSource) error {
+	return setupKeychainStore(source, "")
+}
+
+// SetupWithKeychainAndMigrate is SetupWithKeychain with a one-time migration
+// from the legacy file-based store: if the source is still empty and
+// legacyDir/trust.json exists, its contents are copied into the source and
+// the legacy file is then deleted (best effort). Nothing sensitive is logged.
+func SetupWithKeychainAndMigrate(source StoreSource, legacyDir string) error {
+	return setupKeychainStore(source, legacyDir)
+}
+
+func setupKeychainStore(source StoreSource, legacyDir string) error {
+	if source == nil {
+		return errors.New("mobile: store source required")
+	}
+	mu.Lock()
+	if legacyDir != "" {
+		if err := migrateLegacyStore(source, legacyDir); err != nil {
+			mu.Unlock()
+			return err
+		}
+	}
+	st, err := newKeychainStore(source)
+	if err != nil {
+		mu.Unlock()
+		return err
+	}
+	id, err := st.LoadIdentity()
+	if err != nil {
+		mu.Unlock()
+		return err
+	}
+	if id == nil {
+		id, err = pairing.NewIdentity()
+		if err != nil {
+			mu.Unlock()
+			return err
+		}
+		if err := st.SaveIdentity(id); err != nil {
+			mu.Unlock()
+			return err
+		}
+	}
+	identity = id
+	store = st
 	mu.Unlock()
 	setState("ready")
 	return nil

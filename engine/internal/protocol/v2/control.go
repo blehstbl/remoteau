@@ -245,6 +245,7 @@ const (
 	SetSourceDefault  uint8 = 0 // system default render (loopback)
 	SetSourceDevice   uint8 = 1 // render device selected by name
 	SetSourceTestTone uint8 = 2 // synthetic test tone
+	SetSourcePerApp   uint8 = 3 // per-app process loopback; Name = "p:pid[,pid…]" (only these) or "x:pid" (exclude one)
 )
 
 // Receiver states carried by RECEIVER_STATE (receiver lifecycle for UIs).
@@ -264,7 +265,8 @@ type QualityMode struct {
 }
 
 // SetSource is the SET_SOURCE payload. Name is the UTF-8 device name used
-// when Kind is SetSourceDevice (empty otherwise).
+// when Kind is SetSourceDevice, or the "p:"/"x:" PID list when Kind is
+// SetSourcePerApp (empty otherwise).
 type SetSource struct {
 	Kind uint8
 	Name string
@@ -513,7 +515,7 @@ func DecodeSetSource(b []byte) (SetSource, error) {
 	if len(b) != 3+nameLen {
 		return SetSource{}, errors.New("set-source length mismatch")
 	}
-	if b[0] > SetSourceTestTone {
+	if b[0] > SetSourcePerApp {
 		return SetSource{}, fmt.Errorf("v2 set-source kind out of range: %d", b[0])
 	}
 	return SetSource{Kind: b[0], Name: string(b[3:])}, nil

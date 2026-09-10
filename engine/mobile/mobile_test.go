@@ -1,8 +1,13 @@
 package mobile
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -218,5 +223,211 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// ---------------------------------------------------------------------------
+// keychain-backed trust store
+
+// fakeSource is an in-memory StoreSource test double.
+type fakeSource struct {
+	mu       sync.Mutex
+	identity []byte
+	peers    []byte
+	putIDs   int
+	putPeers int
+}
+
+func (f *fakeSource) GetIdentity() []byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return bytes.Clone(f.identity)
+}
+
+func (f *fakeSource) GetPeers() []byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return bytes.Clone(f.peers)
+}
+
+func (f *fakeSource) PutIdentity(pkcs8 []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.identity = bytes.Clone(pkcs8)
+	f.putIDs++
+	return nil
+}
+
+func (f *fakeSource) PutPeers(json []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.peers = bytes.Clone(json)
+	f.putPeers++
+	return nil
+}
+
+func (f *fakeSource) identityWrites() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.putIDs
+}
+
+func TestSetupWithKeychainCreatesIdentity(t *testing.T) {
+	src := &fakeSource{}
+	if err := SetupWithKeychain(src); err != nil {
+		t.Fatalf("setup keychain: %v", err)
+	}
+	if len(src.GetIdentity()) == 0 {
+		t.Fatal("identity not written to source")
+	}
+	if src.identityWrites() != 1 {
+		t.Fatalf("PutIdentity calls: %d", src.identityWrites())
+	}
+	first := src.GetIdentity()
+
+	// Re-setup must reuse the stored identity (no second write).
+	if err := SetupWithKeychain(src); err != nil {
+		t.Fatalf("setup keychain 2: %v", err)
+	}
+	if src.identityWrites() != 1 {
+		t.Fatalf("PutIdentity calls after re-setup: %d", src.identityWrites())
+	}
+	if !bytes.Equal(src.GetIdentity(), first) {
+		t.Fatal("identity changed across re-setup")
+	}
+}
+
+func TestKeychainStorePeerWriteThrough(t *testing.T) {
+	src := &fakeSource{}
+	if err := SetupWithKeychain(src); err != nil {
+		t.Fatalf("setup keychain: %v", err)
+	}
+
+	rec := pairing.PeerRecord{
+		ID:            [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		Name:          "Office-PC",
+		PairingSecret: bytes.Repeat([]byte{0xAB}, 32),
+		Fingerprint:   "abc123",
+		PairedAt:      1234567890,
+	}
+	mu.Lock()
+	st := store
+	mu.Unlock()
+	if st == nil {
+		t.Fatal("store not set by SetupWithKeychain")
+	}
+	if err := st.SavePeer(rec); err != nil {
+		t.Fatalf("save peer: %v", err)
+	}
+
+	// Peers blob written through to the source, JSON contains the peer.
+	var got []pairing.PeerRecord
+	if err := json.Unmarshal(src.GetPeers(), &got); err != nil {
+		t.Fatalf("peers blob: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("peers blob has %d peers", len(got))
+	}
+	if got[0].Name != "Office-PC" || got[0].Fingerprint != "abc123" || got[0].PairedAt != rec.PairedAt {
+		t.Fatalf("peers blob fields: %+v", got[0])
+	}
+	if got[0].ID != rec.ID {
+		t.Fatal("peer id mismatch in blob")
+	}
+	if !bytes.Equal(got[0].PairingSecret, rec.PairingSecret) {
+		t.Fatal("pairing secret mismatch in blob")
+	}
+	if PeerList() == "[]" {
+		t.Fatal("peer list empty after save")
+	}
+
+	// ForgetPeer flows through the store; blob loses the peer (and secret).
+	if err := ForgetPeer(hex.EncodeToString(rec.ID[:])); err != nil {
+		t.Fatalf("forget peer: %v", err)
+	}
+	var after []pairing.PeerRecord
+	if err := json.Unmarshal(src.GetPeers(), &after); err != nil {
+		t.Fatalf("peers blob after remove: %v", err)
+	}
+	if len(after) != 0 {
+		t.Fatalf("peers blob after remove: %+v", after)
+	}
+	if PeerList() != "[]" {
+		t.Fatalf("peer list after forget: %s", PeerList())
+	}
+}
+
+func TestSetupWithKeychainAndMigrate(t *testing.T) {
+	dir := t.TempDir()
+	legacyID, err := pairing.NewIdentity()
+	if err != nil {
+		t.Fatalf("identity: %v", err)
+	}
+	pkcs8, err := legacyID.MarshalPrivate()
+	if err != nil {
+		t.Fatalf("marshal identity: %v", err)
+	}
+	legacyPeers := []pairing.PeerRecord{{
+		ID:            [16]byte{0xAA, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
+		Name:          "Legacy-PC",
+		PairingSecret: bytes.Repeat([]byte{0x5A}, 32),
+		Fingerprint:   "cafe",
+		PairedAt:      42,
+	}}
+	legacyBlob, err := json.Marshal(fileState{IdentityPKCS8: pkcs8, Peers: legacyPeers})
+	if err != nil {
+		t.Fatalf("marshal legacy: %v", err)
+	}
+	legacyPath := filepath.Join(dir, "trust.json")
+	if err := os.WriteFile(legacyPath, legacyBlob, 0o600); err != nil {
+		t.Fatalf("write legacy: %v", err)
+	}
+
+	src := &fakeSource{}
+	if err := SetupWithKeychainAndMigrate(src, dir); err != nil {
+		t.Fatalf("setup+migrate: %v", err)
+	}
+	// Identity was migrated, not regenerated.
+	if !bytes.Equal(src.GetIdentity(), pkcs8) {
+		t.Fatal("identity not migrated from legacy file")
+	}
+	var got []pairing.PeerRecord
+	if err := json.Unmarshal(src.GetPeers(), &got); err != nil {
+		t.Fatalf("peers blob: %v", err)
+	}
+	if len(got) != 1 || got[0].Name != "Legacy-PC" {
+		t.Fatalf("peers blob: %+v", got)
+	}
+	if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
+		t.Fatalf("legacy file not deleted: %v", err)
+	}
+
+	// No legacy file: plain keychain setup path, no error.
+	if err := SetupWithKeychainAndMigrate(&fakeSource{}, t.TempDir()); err != nil {
+		t.Fatalf("setup+migrate empty dir: %v", err)
+	}
+
+	// Migration is skipped when the source already holds an identity; the
+	// legacy file is left alone and the source is not clobbered.
+	keepID, err := pairing.NewIdentity()
+	if err != nil {
+		t.Fatalf("identity 2: %v", err)
+	}
+	keepPKCS8, err := keepID.MarshalPrivate()
+	if err != nil {
+		t.Fatalf("marshal identity 2: %v", err)
+	}
+	if err := os.WriteFile(legacyPath, legacyBlob, 0o600); err != nil {
+		t.Fatalf("rewrite legacy: %v", err)
+	}
+	src2 := &fakeSource{identity: keepPKCS8}
+	if err := SetupWithKeychainAndMigrate(src2, dir); err != nil {
+		t.Fatalf("setup+migrate 2: %v", err)
+	}
+	if !bytes.Equal(src2.GetIdentity(), keepPKCS8) {
+		t.Fatal("source identity clobbered by migration")
+	}
+	if _, err := os.Stat(legacyPath); os.IsNotExist(err) {
+		t.Fatal("legacy file deleted even though source was not empty")
+	}
 }
 

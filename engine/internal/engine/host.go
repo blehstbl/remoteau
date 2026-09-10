@@ -14,12 +14,14 @@ import (
 	"net/netip"
 	"path/filepath"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"remote-au/internal/audio"
+	"remote-au/internal/audio/wasapi"
 	"remote-au/internal/codec"
 	"remote-au/internal/discovery"
 	"remote-au/internal/logging"
@@ -44,6 +46,17 @@ type HostOptions struct {
 	// ToneMode selects the synthetic test pattern when CaptureSource is
 	// audio.SourceTestTone (Phase 11 diagnostics).
 	ToneMode audio.ToneMode
+
+	// Per-application capture (Phase 9). When either list is non-empty the
+	// host captures via WASAPI process loopback instead of the normal
+	// CaptureSource/DeviceSelector flow: CaptureApps = capture ONLY these
+	// PIDs, ExcludeApps = capture everything EXCEPT these PIDs (single PID;
+	// the API takes one excluded target per activation). Exactly one of the
+	// two is populated while per-app mode is active; SetSourceDevice /
+	// SetCaptureSource clear both. Windows only — other platforms get a
+	// clear "windows only" error from the wasapi stub.
+	CaptureApps []uint32
+	ExcludeApps []uint32
 
 	// OnPairingCode is invoked when an unpaired device starts pairing; the
 	// UI must display this code for the user to enter on the phone.
@@ -709,10 +722,13 @@ func (h *Host) SetQuality(minBitrate, maxBitrate int, fecBias bool) {
 }
 
 // SetSourceDevice switches the capture source device at runtime (Phase 9 hot
-// switching). An empty selector follows the system default.
+// switching). An empty selector follows the system default. Per-app capture
+// (CaptureApps/ExcludeApps) is cleared: an explicit device choice cancels it.
 func (h *Host) SetSourceDevice(selector string) error {
 	h.mu.Lock()
 	h.opts.DeviceSelector = selector
+	h.opts.CaptureApps = nil
+	h.opts.ExcludeApps = nil
 	old := h.capture
 	h.capture = nil
 	h.mu.Unlock()
@@ -723,15 +739,110 @@ func (h *Host) SetSourceDevice(selector string) error {
 }
 
 // SetCaptureSource switches between loopback and microphone capture.
+// Per-app capture is cleared: an explicit source choice cancels it.
 func (h *Host) SetCaptureSource(source audio.Source) error {
 	h.mu.Lock()
 	h.opts.CaptureSource = source
+	h.opts.CaptureApps = nil
+	h.opts.ExcludeApps = nil
 	old := h.capture
 	h.capture = nil
 	h.mu.Unlock()
 	if old != nil {
 		return old.Close()
 	}
+	return nil
+}
+
+// SetCaptureApps switches to per-application capture via WASAPI process
+// loopback (Phase 9). exclude=false captures ONLY the given PIDs (one
+// activation per PID, mixed); exclude=true captures system audio minus the
+// single given PID. The next ensureCapture reopens the capture stream; the
+// host validates PIDs and stays authoritative (bad requests are rejected).
+func (h *Host) SetCaptureApps(pids []uint32, exclude bool) error {
+	if len(pids) == 0 {
+		return errors.New("engine: per-app capture requires at least one process id")
+	}
+	if exclude && len(pids) > 1 {
+		return errors.New("engine: per-app exclude mode supports a single process id")
+	}
+	seen := make(map[uint32]bool, len(pids))
+	clean := make([]uint32, 0, len(pids))
+	for _, p := range pids {
+		if p == 0 {
+			return errors.New("engine: process id 0 is invalid")
+		}
+		if seen[p] {
+			continue
+		}
+		seen[p] = true
+		clean = append(clean, p)
+	}
+	pids = clean
+
+	h.mu.Lock()
+	if exclude {
+		h.opts.ExcludeApps = pids
+		h.opts.CaptureApps = nil
+	} else {
+		h.opts.CaptureApps = pids
+		h.opts.ExcludeApps = nil
+	}
+	h.opts.CaptureSource = audio.SourceLoopback
+	h.opts.DeviceSelector = ""
+	old := h.capture
+	h.capture = nil
+	h.mu.Unlock()
+	if old != nil {
+		return old.Close()
+	}
+	return nil
+}
+
+// ForgetPeer removes a paired peer (identified by its 16-byte device-ID hex
+// string) from the trust store, the in-memory trusted set, and any live
+// connection; used by tray/UI "forget device".
+func (h *Host) ForgetPeer(deviceIDHex string) error {
+	raw, err := hex.DecodeString(strings.TrimSpace(deviceIDHex))
+	if err != nil || len(raw) != 16 {
+		return fmt.Errorf("engine: invalid device id %q", deviceIDHex)
+	}
+	var id [16]byte
+	copy(id[:], raw)
+
+	peers, err := h.opts.Store.Peers()
+	if err != nil {
+		return err
+	}
+	fp := ""
+	for _, p := range peers {
+		if p.ID == id {
+			fp = p.Fingerprint
+			break
+		}
+	}
+	if fp == "" {
+		return fmt.Errorf("engine: peer %s is not paired", deviceIDHex)
+	}
+	if err := h.opts.Store.RemovePeer(id); err != nil {
+		return err
+	}
+
+	h.mu.Lock()
+	delete(h.trusted, fp)
+	var victim *hostStream
+	connKey := hex.EncodeToString(id[:]) // conns are keyed by lowercase hex PeerIDString
+	for key, st := range h.conns {
+		if key == connKey {
+			victim = st
+			delete(h.conns, key)
+		}
+	}
+	h.mu.Unlock()
+	if victim != nil {
+		_ = victim.conn.Close() // stream teardown unregisters on its own
+	}
+	h.notifyReceivers()
 	return nil
 }
 
@@ -1289,7 +1400,7 @@ func (h *Host) handleControl(st *hostStream, m protocolv2.Message) {
 		if err != nil {
 			return
 		}
-		ok, detail := h.applySetSource(src)
+		ok, detail := h.applySetSourceWithApps(src)
 		if !ok {
 			h.log.Warnf("set-source rejected (kind %d %q): %s", src.Kind, src.Name, detail)
 		} else {
@@ -1434,6 +1545,60 @@ func opusAvailable() bool {
 	return codec.OpusAvailable()
 }
 
+// applySetSourceWithApps extends applySetSource (qualitymode.go) with the
+// per-app kind (Phase 9); all other kinds fall through unchanged.
+func (h *Host) applySetSourceWithApps(src protocolv2.SetSource) (bool, string) {
+	if src.Kind == protocolv2.SetSourcePerApp {
+		pids, exclude, err := parsePerAppSourceName(src.Name)
+		if err != nil {
+			return false, err.Error()
+		}
+		if err := h.SetCaptureApps(pids, exclude); err != nil {
+			return false, err.Error()
+		}
+		if exclude {
+			return true, fmt.Sprintf("source: all apps except pid %v", pids)
+		}
+		return true, fmt.Sprintf("source: apps %v only", pids)
+	}
+	return h.applySetSource(src)
+}
+
+// parsePerAppSourceName decodes a per-app SET_SOURCE name: "p:123,456"
+// captures only those PIDs, "x:123" excludes one PID. PIDs must be > 0;
+// exclude mode accepts a single PID (one excluded target per activation).
+func parsePerAppSourceName(name string) ([]uint32, bool, error) {
+	s := strings.TrimSpace(name)
+	if len(s) < 3 || (s[0] != 'p' && s[0] != 'x') || s[1] != ':' {
+		return nil, false, fmt.Errorf("per-app source must be p:<pid[,pid…]> or x:<pid>, got %q", name)
+	}
+	exclude := s[0] == 'x'
+	var pids []uint32
+	seen := make(map[uint32]bool)
+	for _, part := range strings.Split(s[2:], ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return nil, false, fmt.Errorf("empty pid in per-app source %q", name)
+		}
+		v, err := strconv.ParseUint(part, 10, 32)
+		if err != nil {
+			return nil, false, fmt.Errorf("bad pid %q in per-app source %q", part, name)
+		}
+		if v == 0 {
+			return nil, false, fmt.Errorf("pid 0 is invalid in per-app source %q", name)
+		}
+		p := uint32(v)
+		if !seen[p] {
+			seen[p] = true
+			pids = append(pids, p)
+		}
+	}
+	if exclude && len(pids) > 1 {
+		return nil, false, fmt.Errorf("per-app exclude supports one pid, got %d in %q", len(pids), name)
+	}
+	return pids, exclude, nil
+}
+
 func openCapture(source audio.Source, selector string, format audio.Format, logger logging.Logger) (audio.Capture, error) {
 	return nil, errors.New("engine: host requires a backend (Backend option)")
 }
@@ -1443,6 +1608,28 @@ func (h *Host) ensureCaptureViaBackend() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.capture != nil {
+		return nil
+	}
+	// Per-app capture (Phase 9): explicit process selection wins over every
+	// other source. Windows-only; other platforms get a clear error from the
+	// wasapi stub (processloopback_other.go).
+	if len(h.opts.CaptureApps) > 0 || len(h.opts.ExcludeApps) > 0 {
+		pids := h.opts.CaptureApps
+		exclude := false
+		if len(pids) == 0 {
+			pids = h.opts.ExcludeApps
+			exclude = true
+		}
+		cap, err := wasapi.OpenProcessLoopback(pids, exclude, h.opts.Format, h.log)
+		if err != nil {
+			return fmt.Errorf("open process loopback: %w", err)
+		}
+		h.capture = cap
+		if exclude {
+			h.log.Infof("capturing system audio except pid %v", pids)
+		} else {
+			h.log.Infof("capturing pids %v only", pids)
+		}
 		return nil
 	}
 	if h.opts.CaptureSource == audio.SourceTestTone {

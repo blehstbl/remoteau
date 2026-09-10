@@ -6,6 +6,7 @@ import SwiftUI
 /// the v1-only build stays intact.
 #if canImport(RemoteAU)
 import RemoteAU
+import Security
 
 /// Bridges the Go engine callbacks into Swift.
 final class GoMediaSink: NSObject, RemoteAUMediaSink {
@@ -46,6 +47,144 @@ final class GoPINSource: NSObject, RemoteAURequestSource {
     }
 }
 
+/// Keychain-backed trust storage: implements the Go `StoreSource` interface
+/// (bound as the RemoteAUStoreSource protocol) so the engine keeps its
+/// identity key and paired-peer records in the iOS Keychain instead of a
+/// file in the app container.
+///
+/// Binding shapes assumed (consistent with GoMediaSink/GoPINSource above and
+/// the Error?-returning RemoteAU* calls): Go `[]byte` bridges to `Data?`,
+/// Go `error` bridges to an `Error?` return (gobind protocol methods return
+/// the error rather than throwing), and Go `GetX` becomes `getX`.
+final class KeychainTrust: NSObject, RemoteAUStoreSource {
+    private static let service = "dev.remoteau.trust"
+    private static let identityAccount = "identity"
+    private static let peersAccount = "peers"
+
+    /// PKCS#8 identity blob, or nil when none is stored. Read errors also
+    /// surface as nil (the Go interface has no error channel for reads); the
+    /// engine then provisions a fresh identity.
+    func getIdentity() -> Data? {
+        KeychainTrust.read(account: KeychainTrust.identityAccount)
+    }
+
+    /// JSON array of paired peers, or nil when none is stored.
+    func getPeers() -> Data? {
+        KeychainTrust.read(account: KeychainTrust.peersAccount)
+    }
+
+    /// Upserts the identity blob. Go always passes a marshalled key; nil is
+    /// treated as a no-op.
+    func putIdentity(_ pkcs8: Data?) -> Error? {
+        guard let pkcs8 else { return nil }
+        return KeychainTrust.upsert(account: KeychainTrust.identityAccount, data: pkcs8)
+    }
+
+    /// Upserts the peers JSON blob (Go always sends a valid JSON array,
+    /// including "[]" once the last peer is forgotten).
+    func putPeers(_ json: Data?) -> Error? {
+        guard let json else { return nil }
+        return KeychainTrust.upsert(account: KeychainTrust.peersAccount, data: json)
+    }
+
+    /// One-time migration of the legacy file-based trust store
+    /// (<dir>/RemoteAU/trust.json) into the Keychain. Runs only while the
+    /// Keychain has no identity, so it can never overwrite newer Keychain
+    /// data. Only trust.json is touched — never anything else in the
+    /// directory — and the file is removed only after the writes succeeded
+    /// (the Go-side migration retries it on the next launch otherwise).
+    func migrateLegacyFile(dir: URL) {
+        guard getIdentity() == nil else { return }
+        let legacyURL = dir.appendingPathComponent("RemoteAU", isDirectory: true)
+            .appendingPathComponent("trust.json")
+        guard let raw = try? Data(contentsOf: legacyURL),
+              let state = try? JSONDecoder().decode(LegacyTrustFile.self, from: raw) else {
+            return
+        }
+        var migrated = true
+        if let pkcs8 = state.identity_pkcs8 {
+            migrated = putIdentity(pkcs8) == nil
+        }
+        if migrated, let peers = state.peers,
+           let blob = try? JSONEncoder().encode(peers) {
+            migrated = putPeers(blob) == nil
+        }
+        if migrated {
+            try? FileManager.default.removeItem(at: legacyURL)
+        }
+    }
+
+    // MARK: - Keychain plumbing
+
+    /// Mirror of the Go fileState / pairing.PeerRecord wire format (property
+    /// names line up with the Go JSON tags so the engine unmarshals the
+    /// re-encoded peers array cleanly).
+    private struct LegacyTrustFile: Codable {
+        struct LegacyPeer: Codable {
+            var id: Data?
+            var name: String?
+            var pairing_secret: Data?
+            var fingerprint: String?
+            var paired_at: Int64?
+        }
+        var identity_pkcs8: Data?
+        var peers: [LegacyPeer]?
+    }
+
+    private static func baseQuery(account: String) -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+    }
+
+    private static func read(account: String) -> Data? {
+        var query = baseQuery(account: account)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status == errSecSuccess, let data = item as? Data else { return nil }
+        return data
+    }
+
+    private static func upsert(account: String, data: Data) -> Error? {
+        let changes: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+        ]
+        let updateStatus = SecItemUpdate(baseQuery(account: account) as CFDictionary,
+                                         changes as CFDictionary)
+        if updateStatus == errSecSuccess {
+            return nil
+        }
+        if updateStatus != errSecItemNotFound {
+            return statusError(updateStatus)
+        }
+        var add = baseQuery(account: account)
+        add[kSecValueData as String] = data
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        let addStatus = SecItemAdd(add as CFDictionary, nil)
+        if addStatus == errSecSuccess {
+            return nil
+        }
+        if addStatus == errSecDuplicateItem {
+            // Raced with another writer; the item now exists, update it.
+            let retry = SecItemUpdate(baseQuery(account: account) as CFDictionary,
+                                      changes as CFDictionary)
+            return retry == errSecSuccess ? nil : statusError(retry)
+        }
+        return statusError(addStatus)
+    }
+
+    private static func statusError(_ status: OSStatus) -> NSError {
+        NSError(domain: NSOSStatusErrorDomain, code: Int(status),
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Keychain trust-store operation failed (OSStatus \(status))"])
+    }
+}
+
 /// V2Controller exposes the Go v2 engine to SwiftUI.
 @MainActor
 final class V2Controller: ObservableObject {
@@ -54,16 +193,24 @@ final class V2Controller: ObservableObject {
     @Published var pairedPeers: String = "[]"
 
     private var sink: GoMediaSink?
+    // Keeps the bound StoreSource object alive alongside the Go-side ref.
+    private var trustStore: KeychainTrust?
 
     func setup() {
         // Data dir: app support container.
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let dir = base.appendingPathComponent("RemoteAU", isDirectory: true).path
-        let err = RemoteAUSetup(dir)
+        // Move the legacy file-based trust store into the Keychain first;
+        // the Go-side migration inside RemoteAUSetupWithKeychainAndMigrate
+        // only runs while the Keychain is still empty, so the two compose.
+        let trust = KeychainTrust()
+        trust.migrateLegacyFile(dir: base)
+        let err = RemoteAUSetupWithKeychainAndMigrate(trust, dir)
         if err != nil {
             lastError = err.localizedDescription
             return
         }
+        trustStore = trust
         RemoteAUSetStateSink(GoStateSink { [weak self] json in
             Task { @MainActor in
                 self?.handleState(json)
@@ -207,6 +354,17 @@ final class V2Controller: ObservableObject {
     }
     func stop() {}
     func forgetPeer(idHex: String) {}
+}
+
+/// No-op mirror of the real KeychainTrust (framework build only): same API
+/// shape so call sites compile unchanged in the v1-only build. The real
+/// class conforms to RemoteAUStoreSource, which does not exist here.
+final class KeychainTrust {
+    func migrateLegacyFile(dir: URL) {}
+    func getIdentity() -> Data? { nil }
+    func getPeers() -> Data? { nil }
+    func putIdentity(_ pkcs8: Data?) -> Error? { nil }
+    func putPeers(_ json: Data?) -> Error? { nil }
 }
 
 #endif

@@ -45,10 +45,6 @@ func (b *Backend) OpenCapture(opts audio.CaptureOptions) (audio.Capture, error) 
 	if err := opts.Format.Validate(); err != nil {
 		return nil, err
 	}
-	logger := opts.Logger
-	if logger == nil {
-		logger = logging.Nop()
-	}
 
 	if err := coInitialize(); err != nil {
 		return nil, err
@@ -76,33 +72,39 @@ func (b *Backend) OpenCapture(opts audio.CaptureOptions) (audio.Capture, error) 
 	}
 	defer dev.release()
 
-	audioClientObj, err := dev.activate(iidIAudioClient)
-	if err != nil {
-		return nil, err
-	}
-	client := &audioClient{obj: audioClientObj}
-	defer func() {
-		if client != nil {
-			client.release()
-			client = nil
-		}
-	}()
-
-	mixFormat, err := client.getMixFormat()
-	if err != nil {
-		return nil, fmt.Errorf("get mix format: %w", err)
-	}
-
 	flags := streamFlagsNoPersist
 	if opts.Source == audio.SourceLoopback {
 		flags |= streamFlagsLoopback
 	}
-	if err := client.initialize(shareModeShared, flags, hnsMilliseconds(200), mixFormat); err != nil {
+
+	audioClientObj, err := dev.activate(iidIAudioClient)
+	if err != nil {
+		return nil, err
+	}
+	devID, _ := dev.id()
+	devName := dev.friendlyName()
+	return newPacketCapture(audioClientObj, flags, opts, devName, devID)
+}
+
+// newPacketCapture finishes configuring an activated IAudioClient for the
+// packet-poll capture loop: mix format → initialize → capture service →
+// converter → ring → poll goroutine. Shared by OpenCapture (endpoint
+// activation) and OpenProcessLoopback (ActivateAudioInterfaceAsync). It owns
+// clientObj: released on error, moved into the returned Capture otherwise.
+func newPacketCapture(clientObj unsafe.Pointer, streamFlags int, opts audio.CaptureOptions, devName, devID string) (*Capture, error) {
+	client := &audioClient{obj: clientObj}
+	mixFormat, err := client.getMixFormat()
+	if err != nil {
+		client.release()
+		return nil, fmt.Errorf("get mix format: %w", err)
+	}
+	if err := client.initialize(shareModeShared, streamFlags, hnsMilliseconds(200), mixFormat); err != nil {
+		client.release()
 		return nil, fmt.Errorf("initialize capture (%s): %w", formatSummary(mixFormat), err)
 	}
-
 	svc, err := client.getService(iidIAudioCaptureClient)
 	if err != nil {
+		client.release()
 		return nil, err
 	}
 	cc := &captureClient{obj: svc}
@@ -114,6 +116,11 @@ func (b *Backend) OpenCapture(opts audio.CaptureOptions) (audio.Capture, error) 
 		ringFrames = opts.Format.Rate / 4
 	}
 	ring := audio.NewRing(ringFrames*opts.Format.BytesPerFrame(), opts.Format.BytesPerFrame())
+
+	logger := opts.Logger
+	if logger == nil {
+		logger = logging.Nop()
+	}
 	c := &Capture{
 		format: opts.Format,
 		ring:   ring,
@@ -122,13 +129,7 @@ func (b *Backend) OpenCapture(opts audio.CaptureOptions) (audio.Capture, error) 
 		done:   make(chan struct{}),
 		gone:   make(chan struct{}),
 	}
-	c.client = client
-	client = nil // ownership moved
-
-	devID, _ := dev.id()
-	devName := dev.friendlyName()
 	go c.run(cc, conv, devID, devName)
-
 	return c, nil
 }
 

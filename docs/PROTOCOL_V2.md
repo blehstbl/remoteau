@@ -54,9 +54,15 @@ Framing: `msgType:u16 | flags:u16 | requestId:u32 | payloadLen:u32 | payload`
 | 0x0070 | RESUME | recv→send | `{resumeToken:32B, lastSeq:u64}` |
 | 0x0071 | RESUME_OK | send→recv | `{nextSeq:u64, formatGen:u32}` |
 | 0x0080 | QUALITY_MODE | recv→send | `{mode:u8}` (0=auto 1=lowest-latency 2=lossless 3=robust 4=advanced) |
-| 0x0081 | SET_SOURCE | recv→send | `{kind:u8 (0=default 1=render device by name 2=test tone), name:str16}` |
+| 0x0081 | SET_SOURCE | recv→send | `{kind:u8 (0=default 1=render device by name 2=test tone 3=per-app), name:str16}` (kind 3: name = `p:<pid[,pid…]>` capture only those PIDs, or `x:<pid>` capture all but one PID; Windows only) |
 | 0x0082 | SET_SOURCE_ACK | send→recv | `{ok:u8, detail:str16}` |
 | 0x0083 | RECEIVER_STATE | recv→send | `{state:u8}` (0=connecting 1=pairing 2=buffering 3=playing 4=interrupted 5=reconnecting 6=stopped) |
+
+SET_SOURCE kind 3 (per-app) is host-authoritative: the host validates the PID
+list (PIDs > 0, exclude mode limited to one PID — Windows takes a single
+excluded target per activation) and answers SET_SOURCE_ACK with OK=0 plus a
+detail when it rejects or cannot honor the request. Process listing is a
+host-side UI concern; there is deliberately no protocol message for it.
 
 `Caps` (also used inside HELLO / STREAM_START / STREAM_ACK):
 
