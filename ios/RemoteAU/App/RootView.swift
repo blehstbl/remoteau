@@ -867,7 +867,7 @@ struct PairingSheet: View {
     @Environment(\.dismiss) private var dismiss
     // Shared with RootView so scanning the PC's QR prefills the host id.
     @AppStorage("v2HostDeviceID") private var storedHostDeviceID: String = ""
-    @State private var pin = ""
+    @StateObject private var pinPrompt: PINPrompt
     @State private var connecting = false
     @State private var showScanner = false
     @State private var linkError: String? = nil
@@ -894,7 +894,11 @@ struct PairingSheet: View {
         self._v2FEC = v2FEC
         self._v2DTX = v2DTX
         self._scannedLink = State(initialValue: preScanned)
-        self._pin = State(initialValue: preScanned?.code ?? "")
+        self._pinPrompt = StateObject(wrappedValue: {
+            let prompt = PINPrompt()
+            prompt.preloaded = preScanned?.code
+            return prompt
+        }())
     }
 
     var body: some View {
@@ -930,6 +934,22 @@ struct PairingSheet: View {
             .sheet(isPresented: $showScanner) {
                 scannerSheet
             }
+            .sheet(isPresented: $pinPrompt.isPresented) {
+                PINEntrySheet(prompt: pinPrompt)
+            }
+            .onChange(of: v2.state) { newState in
+                // The prompt is only meaningful while pairing. Clear the
+                // spinner when the attempt ends, and dismiss once we're live.
+                if newState == "streaming" {
+                    connecting = false
+                    dismiss()
+                } else if newState.hasPrefix("error") || newState == "idle" {
+                    connecting = false
+                }
+            }
+            .onChange(of: v2.lastError) { err in
+                if !err.isEmpty { connecting = false }
+            }
         }
     }
 
@@ -947,15 +967,9 @@ struct PairingSheet: View {
             .frame(maxWidth: .infinity)
             .padding(.vertical, Theme.spacingL)
         } else {
-            Text("Enter the pairing code shown on the PC, or scan its QR code to connect securely.")
+            Text("Tap Connect, then type the code the PC displays — or scan its QR code.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
-            TextField("Pairing code", text: $pin)
-                .textFieldStyle(.roundedBorder)
-                .keyboardType(.numberPad)
-                .font(.title2.monospacedDigit())
-                .multilineTextAlignment(.center)
-                .accessibilityLabel("Pairing code")
 
             Button {
                 connect()
@@ -964,7 +978,6 @@ struct PairingSheet: View {
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
-            .disabled(pin.count < 4)
 
             Button {
                 linkError = nil
@@ -1030,7 +1043,6 @@ struct PairingSheet: View {
         }
         linkError = nil
         scannedLink = link
-        pin = link.code
         // A QR that carries a device id is usable as the relay host id too,
         // so mirror it into the shared field the manual card reads.
         if let id = link.id {
@@ -1038,7 +1050,14 @@ struct PairingSheet: View {
         }
         UIAccessibility.post(notification: .announcement,
                              argument: "Pairing code scanned. Connecting.")
-        connect()
+        if pinPrompt.isPresented {
+            // The engine is already waiting for the code; hand it over now.
+            pinPrompt.submit(link.code)
+        } else {
+            // Seed the scanned code so the next request resolves without UI.
+            pinPrompt.preloaded = link.code
+            connect()
+        }
     }
 
     private func connect() {
@@ -1050,8 +1069,8 @@ struct PairingSheet: View {
             fec: v2FEC,
             dtx: v2DTX
         )
-        // `pinPrompt` is `() async -> String`; the code (typed or scanned)
-        // is already seeded into `pin`, so this resolves immediately.
+        // The engine calls this once the host has displayed its code, so the
+        // prompt appears exactly when the user can read it off the PC.
         if let relay {
             // Prefer a scanned id (it is the authoritative peer id) over the
             // manually typed one, then connect through the relay.
@@ -1060,13 +1079,13 @@ struct PairingSheet: View {
                             hostDeviceID: hostID,
                             name: Self.deviceName(),
                             advanced: adv) {
-                return pin
+                await pinPrompt.request()
             }
         } else {
             v2.connect(host: targetHost,
                        name: Self.deviceName(),
                        advanced: adv) {
-                return pin
+                await pinPrompt.request()
             }
         }
     }
