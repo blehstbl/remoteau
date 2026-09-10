@@ -121,12 +121,16 @@ func (o *opusCodec) DecodeFrame(wire []byte, lost bool, out []byte) (int, error)
 	var n int
 	var err error
 	if lost || len(wire) == 0 {
-		n, err = o.dec.DecodePLCFloat32(o.decOut)
+		// DecodePLCFloat32 synthesizes a full frame and returns only an error.
+		if err = o.dec.DecodePLCFloat32(o.decOut); err != nil {
+			return 0, fmt.Errorf("opus decode plc: %w", err)
+		}
+		n = o.cfg.FrameSamples() * o.cfg.Channels
 	} else {
 		n, err = o.dec.DecodeFloat32(wire, o.decOut)
-	}
-	if err != nil {
-		return 0, fmt.Errorf("opus decode: %w", err)
+		if err != nil {
+			return 0, fmt.Errorf("opus decode: %w", err)
+		}
 	}
 	want := o.cfg.PCMFrameBytes()
 	if n*2 > want {

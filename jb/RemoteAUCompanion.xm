@@ -13,8 +13,9 @@
 #define RA_SIGNAL_PATH @"/var/mobile/Library/Preferences/dev.remoteau.companion"
 
 static void raWriteFlag(BOOL on) {
+    NSString *value = on ? @"1" : @"0";
     [[NSFileManager defaultManager] createFileAtPath:RA_SIGNAL_PATH
-                                            contents:[(on ? @YES : @NO) dataUsingEncoding:NSUTF8StringEncoding]
+                                            contents:[value dataUsingEncoding:NSUTF8StringEncoding]
                                           attributes:nil];
 }
 
