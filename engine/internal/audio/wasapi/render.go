@@ -55,7 +55,9 @@ func (b *Backend) OpenPlayback(opts audio.PlaybackOptions) (audio.Playback, erro
 	if err := coInitialize(); err != nil {
 		return nil, err
 	}
-	coUninitialize()
+	// COM is per-thread: keep it initialized on THIS thread until setup is
+	// done (the render goroutine initializes its own apartment separately).
+	defer coUninitialize()
 
 	enum, err := newMMDeviceEnumerator()
 	if err != nil {
@@ -158,7 +160,9 @@ func (p *Playback) run(pull audio.PullFunc, ev windows.Handle, devName string) {
 	defer p.client.stop()
 
 	deviceBytesPerFrame := p.deviceBytesPerFrame
-	out := make([]byte, int(p.bufferFrames)*deviceBytesPerFrame)
+	// `out` holds engine-format S16LE (the resampler emits device-rate S16 in
+	// the same channel layout), so size it by the engine frame size.
+	out := make([]byte, int(p.bufferFrames)*p.format.BytesPerFrame()+64)
 
 	for {
 		select {
@@ -207,10 +211,13 @@ func (p *Playback) run(pull audio.PullFunc, ev windows.Handle, devName string) {
 			return
 		}
 		buf := unsafe.Slice((*byte)(data), n*deviceBytesPerFrame)
+		// `out` holds n device-rate frames of S16LE PCM in the ENGINE channel
+		// layout; map to the device channel layout (safe for mismatches).
+		src := out[:n*p.format.BytesPerFrame()]
 		if p.deviceIsFloat {
-			s16ToF32(buf, out[:n*deviceBytesPerFrame])
+			s16ToF32Mapped(buf, src, p.format.Channels, p.deviceChannels)
 		} else {
-			copy(buf, out[:n*deviceBytesPerFrame])
+			s16ToS16Mapped(buf, src, p.format.Channels, p.deviceChannels)
 		}
 		p.render.releaseBuffer(uint32(n), 0)
 	}
@@ -337,11 +344,47 @@ func s16FromF64(v float64) uint16 {
 	return uint16(int16(math.Round(v * 32767)))
 }
 
-func s16ToF32(dst []byte, src []byte) {
-	n := len(src) / 2
-	f := unsafe.Slice((*float32)(unsafe.Pointer(unsafe.Pointer(&dst[0]))), n)
-	for i := 0; i < n; i++ {
-		s := int16(binary.LittleEndian.Uint16(src[i*2:]))
-		f[i] = float32(s) / 32768.0
+// s16ToF32Mapped converts interleaved S16LE (srcCh channels) to interleaved
+// float32 (dstCh channels), duplicating mono and zero-filling extra device
+// channels. dst must hold nFrames*dstCh floats.
+func s16ToF32Mapped(dst, src []byte, srcCh, dstCh int) {
+	if srcCh <= 0 || dstCh <= 0 {
+		return
+	}
+	nFrames := len(src) / (srcCh * 2)
+	out := unsafe.Slice((*float32)(unsafe.Pointer(&dst[0])), nFrames*dstCh)
+	for f := 0; f < nFrames; f++ {
+		for c := 0; c < dstCh; c++ {
+			var v float32
+			switch {
+			case c < srcCh:
+				s := int16(binary.LittleEndian.Uint16(src[(f*srcCh+c)*2:]))
+				v = float32(s) / 32768.0
+			case srcCh == 1:
+				s := int16(binary.LittleEndian.Uint16(src[f*2:]))
+				v = float32(s) / 32768.0
+			}
+			out[f*dstCh+c] = v
+		}
+	}
+}
+
+// s16ToS16Mapped copies/maps interleaved S16LE between channel layouts.
+func s16ToS16Mapped(dst, src []byte, srcCh, dstCh int) {
+	if srcCh <= 0 || dstCh <= 0 {
+		return
+	}
+	nFrames := len(src) / (srcCh * 2)
+	for f := 0; f < nFrames; f++ {
+		for c := 0; c < dstCh; c++ {
+			var s int16
+			switch {
+			case c < srcCh:
+				s = int16(binary.LittleEndian.Uint16(src[(f*srcCh+c)*2:]))
+			case srcCh == 1:
+				s = int16(binary.LittleEndian.Uint16(src[f*2:]))
+			}
+			binary.LittleEndian.PutUint16(dst[(f*dstCh+c)*2:], uint16(s))
+		}
 	}
 }

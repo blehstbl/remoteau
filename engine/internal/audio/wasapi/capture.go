@@ -49,8 +49,10 @@ func (b *Backend) OpenCapture(opts audio.CaptureOptions) (audio.Capture, error) 
 	if err := coInitialize(); err != nil {
 		return nil, err
 	}
-	// COM is per-thread; the capture goroutine initializes its own apartment.
-	coUninitialize()
+	// COM is per-thread: keep it initialized on THIS thread until we are done
+	// creating the enumerator/device (the capture goroutine initializes its
+	// own apartment separately).
+	defer coUninitialize()
 
 	enum, err := newMMDeviceEnumerator()
 	if err != nil {

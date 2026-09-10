@@ -188,6 +188,24 @@ func runRecv2(args []string, stdout, stderr io.Writer, backend audio.Backend, fo
 		Name:     name,
 		Store:    store,
 		PINProvider: func() (string, error) {
+			// Automation hooks (CI / scripts): RAU_PIN supplies the code
+			// directly; RAU_PIN_FILE waits for the host's code to appear in a
+			// file. Interactive users get the prompt.
+			if pin := os.Getenv("RAU_PIN"); pin != "" {
+				return pin, nil
+			}
+			if pinFile := os.Getenv("RAU_PIN_FILE"); pinFile != "" {
+				deadline := time.Now().Add(30 * time.Second)
+				for time.Now().Before(deadline) {
+					if data, rerr := os.ReadFile(pinFile); rerr == nil {
+						if code := strings.TrimSpace(string(data)); code != "" {
+							return code, nil
+						}
+					}
+					time.Sleep(100 * time.Millisecond)
+				}
+				return "", fmt.Errorf("timed out waiting for pairing code in %s", pinFile)
+			}
 			fmt.Fprint(stdout, "Enter the pairing code shown on the PC: ")
 			var code string
 			if _, err := fmt.Fscanln(os.Stdin, &code); err != nil {

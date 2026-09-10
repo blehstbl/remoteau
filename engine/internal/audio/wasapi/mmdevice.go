@@ -119,11 +119,9 @@ func (d *mmDevice) friendlyName() string {
 	if hr != 0 {
 		return ""
 	}
-	defer callCom(vtable(store)[7], store) // PropVariantClear via vtable is 6..; use manual clear below
-	// Actually IPropertyStore vtable: QueryInterface(0) AddRef(1) Release(2)
-	// GetCount(3) GetAt(4) GetValue(5) SetValue(6) Commit(7). There is no
-	// PropVariantClear on the store; clear via ole32.
-	clearPropVariant(&pv)
+	// Free the PROPVARIANT only AFTER reading it (IPropertyStore has no
+	// PropVariantClear; ole32 does).
+	defer clearPropVariant(&pv)
 
 	vt := *(*uint16)(unsafe.Pointer(&pv[0]))
 	if vt != 31 { // VT_LPWSTR
