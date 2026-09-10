@@ -80,21 +80,26 @@ jobs:
           gomobile init
           mkdir -p ios/Frameworks build
 
+          # The Go module lives in engine/, so run gomobile from there.
+          cd engine
+
           # Device slice: cgo flags point at the device libopus.
           PKG_CONFIG_PATH="$GITHUB_WORKSPACE/opus-ios/device/lib/pkgconfig" \
           CGO_CFLAGS="-I$GITHUB_WORKSPACE/opus-ios/device/include/opus" \
           CGO_LDFLAGS="-L$GITHUB_WORKSPACE/opus-ios/device/lib -lopus" \
           gomobile bind -target ios \
-            -o build/RemoteAU-ios.xcframework -prefix RemoteAU \
-            -tags "opus,nolibopusfile" ./engine/mobile
+            -o ../build/RemoteAU-ios.xcframework -prefix RemoteAU \
+            -tags "opus,nolibopusfile" ./mobile
 
           # Simulator slice: cgo flags point at the merged simulator libopus.
           PKG_CONFIG_PATH="$GITHUB_WORKSPACE/opus-ios/sim/lib/pkgconfig" \
           CGO_CFLAGS="-I$GITHUB_WORKSPACE/opus-ios/sim/include/opus" \
           CGO_LDFLAGS="-L$GITHUB_WORKSPACE/opus-ios/sim/lib -lopus" \
           gomobile bind -target iossimulator \
-            -o build/RemoteAU-sim.xcframework -prefix RemoteAU \
-            -tags "opus,nolibopusfile" ./engine/mobile
+            -o ../build/RemoteAU-sim.xcframework -prefix RemoteAU \
+            -tags "opus,nolibopusfile" ./mobile
+
+          cd ..
 
           # Combine into one xcframework (proper Info.plist written by Xcode).
           DEV_FW=$(find build/RemoteAU-ios.xcframework -maxdepth 2 -name RemoteAU.framework)
