@@ -8,12 +8,13 @@
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
+#import <AVFoundation/AVFoundation.h>
 
 #define RA_SIGNAL_PATH @"/var/mobile/Library/Preferences/dev.remoteau.companion"
 
 static void raWriteFlag(BOOL on) {
     [[NSFileManager defaultManager] createFileAtPath:RA_SIGNAL_PATH
-                                            contents:[on ? @YES : @NO dataUsingEncoding:NSUTF8StringEncoding]
+                                            contents:[(on ? @YES : @NO) dataUsingEncoding:NSUTF8StringEncoding]
                                           attributes:nil];
 }
 
@@ -27,7 +28,7 @@ static void raWriteFlag(BOOL on) {
                     object:nil queue:[NSOperationQueue mainQueue]
                 usingBlock:^(NSNotification *note) {
                     AVAudioSessionRouteChangeReason reason =
-                        [note.userInfo[AVAudioSessionRouteChangeReasonKey] unsignedIntegerValue];
+                        (AVAudioSessionRouteChangeReason)[note.userInfo[AVAudioSessionRouteChangeReasonKey] unsignedIntegerValue];
                     AVAudioSession *session = [AVAudioSession sharedInstance];
                     BOOL hasBT = NO;
                     for (AVAudioSessionPortDescription *out in session.currentRoute.outputs) {

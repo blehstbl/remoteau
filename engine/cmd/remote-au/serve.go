@@ -12,6 +12,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/skip2/go-qrcode"
+
 	"remote-au/internal/audio"
 	"remote-au/internal/engine"
 	"remote-au/internal/logging"
@@ -75,6 +77,15 @@ func runServe(args []string, stdout, stderr io.Writer, backend audio.Backend, fo
 	pairingCode := func(code string) {
 		fmt.Fprintf(stdout, "\n*** PAIRING: enter code %s on the device ***\n\n", code)
 	}
+	pairingInfo := func(code, url string) {
+		fmt.Fprintf(stdout, "\n*** PAIRING ***\n")
+		fmt.Fprintf(stdout, "Code: %s\n", code)
+		fmt.Fprintf(stdout, "URL:  %s\n", url)
+		if qr, qerr := qrcode.New(url, qrcode.Medium); qerr == nil {
+			fmt.Fprintln(stdout, qr.ToSmallString(false))
+		}
+		fmt.Fprintln(stdout, "Scan the QR in the RemoteAU app, or type the code.")
+	}
 
 	// Profile (Phase 14): presets sync naturally with the GUIs.
 	if profileName != "" {
@@ -101,6 +112,7 @@ func runServe(args []string, stdout, stderr io.Writer, backend audio.Backend, fo
 		DeviceSelector: deviceSelector,
 		Format:         format,
 		OnPairingCode:  pairingCode,
+		OnPairingInfo:  pairingInfo,
 		RecordDir:      recordDir,
 		RelayAddr:      relayAddr,
 		ToneMode:       toneMode,

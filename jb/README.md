@@ -18,27 +18,39 @@ integration that stock iOS does not allow.
 
 ## Layout
 
+Theos conventions: the tweak source and its filter plist live next to the
+Makefile, and anything that must be copied verbatim onto the device lives
+under `layout/`.
+
 ```
 jb/
-  control                     Debian package metadata (for .deb build)
+  Makefile
+  RemoteAUCompanion.xm            tweak source (Logos)
+  RemoteAUCompanion.plist         MobileSubstrate filter (com.apple.springboard)
   DEBIAN/
     control
     postinst
-  Library/
-    MobileSubstrate/DynamicLibraries/
-      RemoteAUCompanion.dylib     (placeholder; build with Theos)
-      RemoteAUCompanion.plist     (filter: com.apple.springboard)
-    LaunchDaemons/
-      dev.remoteau.receiver.plist (KeepAlive receiver agent)
+    prerm
+  layout/
+    Library/LaunchDaemons/
+      dev.remoteau.receiver.plist KeepAlive receiver agent
   README.md
 ```
+
+The built `RemoteAUCompanion.dylib` and `RemoteAUCompanion.plist` are installed
+by Theos to `/Library/MobileSubstrate/DynamicLibraries/`. Anything under
+`layout/` is staged at the package root (so the LaunchDaemon lands in
+`/Library/LaunchDaemons/`).
 
 ## Build (on Linux/macOS with Theos, or WSL)
 
 ```
-$THEOS/bin/nicify.pl RemoteAUCompanion   # tweak template
 make package FINALPACKAGE=1
 ```
+
+The `.deb` is written to `packages/`. CI builds this automatically in
+`.github/workflows/build-jb.yml` and uploads the `remoteau-companion-deb`
+artifact.
 
 ## Install
 

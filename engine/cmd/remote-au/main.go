@@ -434,8 +434,10 @@ func parseCaptureSource(name string) (audio.Source, error) {
 		return audio.SourceMicrophone, nil
 	case "loopback":
 		return audio.SourceLoopback, nil
+	case "testtone", "test-tone":
+		return audio.SourceTestTone, nil
 	default:
-		return audio.SourceMicrophone, fmt.Errorf("unknown capture source %q (want mic or loopback)", name)
+		return audio.SourceMicrophone, fmt.Errorf("unknown capture source %q (want mic, loopback, or testtone)", name)
 	}
 }
 

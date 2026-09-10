@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -24,38 +25,39 @@ import (
 
 var version = "dev"
 
-type presetID int
-
-const (
-	presetAuto presetID = iota
-	presetLowest
-	presetLossless
-	presetRobust
-)
-
 // app carries tray-global state.
 type app struct {
-	mu      sync.Mutex
-	host    *engine.Host
-	cancel  context.CancelFunc
-	running bool
-	store   pairing.Store
-	backend audio.Backend
-	logger  logging.Logger
-	logFile io.Closer
-	format  audio.Format
-	preset  presetID
-	muted   bool
+	mu           sync.Mutex
+	host         *engine.Host
+	cancel       context.CancelFunc
+	running      bool
+	store        pairing.Store
+	backend      audio.Backend
+	logger       logging.Logger
+	logFile      io.Closer
+	format       audio.Format
+	preset       presetID
+	muted        bool
 	lastReceiver string
+	autoStream   bool
+	toneMode     audio.ToneMode
+	sourceLabel  string
+	lastError    string
+
+	// Settings window (singleton) state.
+	settingsMu       sync.Mutex
+	settingsUI       *settingsUI
+	settingsStarting bool
 
 	// Menu items we update at runtime.
-	mStatus    *systray.MenuItem
-	mToggle    *systray.MenuItem
-	mMute      *systray.MenuItem
-	mReceivers *systray.MenuItem
-	mAutoStart *systray.MenuItem
-	qualityItems map[presetID]*systray.MenuItem
-	sourceItems  []*systray.MenuItem
+	mStatus       *systray.MenuItem
+	mToggle       *systray.MenuItem
+	mMute         *systray.MenuItem
+	mConnect      *systray.MenuItem
+	mReceivers    *systray.MenuItem
+	mAutoStart    *systray.MenuItem
+	qualityItems  map[presetID]*systray.MenuItem
+	sourceItems   []*systray.MenuItem
 	receiverItems []*systray.MenuItem
 }
 
@@ -63,6 +65,15 @@ func main() {
 	a := &app{
 		format:       audio.DefaultFormat(),
 		qualityItems: make(map[presetID]*systray.MenuItem),
+	}
+	if s, ok := loadSettings(); ok {
+		a.autoStream = s.AutoStream
+		a.lastReceiver = s.LastReceiver
+		a.preset = presetFromName(s.Preset)
+		a.muted = s.Muted
+	} else {
+		a.autoStream = true
+		a.preset = presetAuto
 	}
 
 	backend, err := audio.OpenBackend(audio.DefaultBackendName())
@@ -85,6 +96,15 @@ func main() {
 		a.logger = logPath
 	} else {
 		a.logger, _ = logging.New(io.Discard, "info", "text")
+	}
+
+	// --settings opens the settings window immediately (useful for shortcuts
+	// and smoke testing); the tray still runs.
+	for _, arg := range os.Args[1:] {
+		if arg == "--settings" {
+			a.openSettings()
+			break
+		}
 	}
 
 	systray.Run(a.onReady, a.onExit)
@@ -123,7 +143,15 @@ func (a *app) onReady() {
 	a.mStatus.Disable()
 
 	a.mToggle = systray.AddMenuItem("Stop streaming", "Start/stop the v2 host")
-	a.mMute = systray.AddMenuItemCheckbox("Mute", "Silence all receivers", false)
+	connectTitle := "Connect to last iPhone"
+	if a.lastReceiver != "" {
+		connectTitle = "Connect to " + a.lastReceiver
+	}
+	a.mConnect = systray.AddMenuItem(connectTitle, "Start streaming to the last receiver")
+	a.mMute = systray.AddMenuItemCheckbox("Mute", "Silence all receivers", a.muted)
+	if a.muted {
+		a.mMute.SetTitle("Unmute")
+	}
 	systray.AddSeparator()
 
 	a.mReceivers = systray.AddMenuItem("Receivers", "Connected receivers")
@@ -168,9 +196,18 @@ func (a *app) onReady() {
 		presetLossless: itemLossless,
 		presetRobust:   itemRobust,
 	}
+	// Reflect the persisted preset selection.
+	for id, it := range a.qualityItems {
+		if id == a.preset {
+			it.Check()
+		} else {
+			it.Uncheck()
+		}
+	}
 
 	a.mAutoStart = systray.AddMenuItemCheckbox("Start with Windows", "Launch RemoteAU at login", a.autostartEnabled())
 
+	mSettings := systray.AddMenuItem("Open Settings", "Source, receivers, quality and diagnostics")
 	diag := systray.AddMenuItem("Open log folder", "Show engine diagnostics log")
 	systray.AddSeparator()
 	mExit := systray.AddMenuItem("Exit", "Quit RemoteAU")
@@ -181,10 +218,14 @@ func (a *app) onReady() {
 			select {
 			case <-a.mToggle.ClickedCh:
 				a.toggleStreaming()
+			case <-a.mConnect.ClickedCh:
+				a.connectLast()
 			case <-a.mMute.ClickedCh:
 				a.toggleMute()
 			case <-a.mAutoStart.ClickedCh:
 				a.toggleAutostart()
+			case <-mSettings.ClickedCh:
+				a.openSettings()
 			case <-diag.ClickedCh:
 				openLogFolder()
 			case <-mExit.ClickedCh:
@@ -205,8 +246,12 @@ func (a *app) onReady() {
 	// Receiver list refresher.
 	go a.receiverRefresher()
 
-	// Auto-start streaming at launch.
-	a.startStreaming()
+	// Auto-start streaming at launch (respecting the persisted preference).
+	if a.autoStream {
+		a.startStreaming()
+	} else {
+		a.setStatus("Stopped", "Start streaming")
+	}
 }
 
 func (a *app) onExit() {
@@ -224,6 +269,8 @@ func (a *app) startStreaming() {
 		a.mu.Unlock()
 		return
 	}
+	toneMode := a.toneMode
+	muted := a.muted
 	ctx, cancel := context.WithCancel(context.Background())
 	host, err := engine.NewHost(engine.HostOptions{
 		Name:          hostname(),
@@ -231,23 +278,37 @@ func (a *app) startStreaming() {
 		Backend:       a.backend,
 		ListenAddr:    ":47010",
 		CaptureSource: audio.SourceLoopback,
+		ToneMode:      toneMode,
 		Format:        a.format,
-		OnPairingCode: func(code string) {
-			messageBox("RemoteAU — Pairing",
-				fmt.Sprintf("Enter this code on your iPhone to pair:\n\n    %s", code))
+		OnPairingInfo: func(code, url string) {
+			messageBox("RemoteAU - Pairing",
+				fmt.Sprintf("Pair your iPhone:\n\nCode:  %s\n\nOr scan this URL in the app (QR):\n%s", code, url))
 		},
 		OnReceiversChanged: func(receivers []engine.ReceiverInfo) {
-			if len(receivers) > 0 {
-				a.mu.Lock()
-				a.lastReceiver = receivers[0].Name
-				a.mu.Unlock()
+			if len(receivers) == 0 {
+				return
+			}
+			name := receivers[0].Name
+			a.mu.Lock()
+			changed := name != "" && name != a.lastReceiver
+			if changed {
+				a.lastReceiver = name
+			}
+			a.mu.Unlock()
+			if changed {
+				if a.mConnect != nil {
+					a.mConnect.SetTitle("Connect to " + name)
+				}
+				a.saveSettings()
 			}
 		},
 		Logger: a.logger,
 	})
 	if err != nil {
 		cancel()
+		a.mu.Unlock()
 		messageBox("RemoteAU", fmt.Sprintf("Cannot start host:\n%v", err))
+		a.setError("cannot start host: " + err.Error())
 		return
 	}
 	a.host = host
@@ -255,17 +316,53 @@ func (a *app) startStreaming() {
 	a.running = true
 	a.mu.Unlock()
 
+	if muted {
+		host.MuteAll(true)
+	}
+
 	go func() {
-		if err := host.Run(ctx); err != nil {
-			a.logger.Errorf("host stopped: %v", err)
+		err := host.Run(ctx)
+		if ctx.Err() != nil {
+			return // canceled by stopStreaming/Exit
 		}
 		a.mu.Lock()
+		if a.host == host {
+			a.host = nil
+		}
 		a.running = false
 		a.mu.Unlock()
+		if err != nil {
+			a.logger.Errorf("host stopped: %v", err)
+			a.setError("engine stopped: " + err.Error())
+			return
+		}
 		a.setStatus("Stopped", "Start streaming")
 	}()
 
 	a.setStatus("Waiting for receivers…", "Stop streaming")
+}
+
+// connectLast ensures streaming is running and surfaces the last receiver in
+// the status line/tooltip.
+func (a *app) connectLast() {
+	a.mu.Lock()
+	running := a.running
+	name := a.lastReceiver
+	a.mu.Unlock()
+	if !running {
+		a.startStreaming()
+		a.mu.Lock()
+		running = a.running
+		a.mu.Unlock()
+	}
+	if !running {
+		return // start failed; setError already reported it
+	}
+	if name == "" {
+		name = "last iPhone"
+	}
+	systray.SetTooltip("RemoteAU — last: " + name)
+	a.setStatus("Connecting to "+name+"…", "Stop streaming")
 }
 
 func (a *app) stopStreaming() {
@@ -313,6 +410,7 @@ func (a *app) toggleMute() {
 		a.mMute.Uncheck()
 		a.mMute.SetTitle("Mute")
 	}
+	a.saveSettings()
 }
 
 func (a *app) setStatus(text, toggle string) {
@@ -322,6 +420,81 @@ func (a *app) setStatus(text, toggle string) {
 	if a.mToggle != nil {
 		a.mToggle.SetTitle(toggle)
 	}
+}
+
+// setError records a persistent error/degraded state and surfaces it on the
+// tray status item, its tooltip, and the settings window when open.
+func (a *app) setError(msg string) {
+	a.mu.Lock()
+	a.lastError = msg
+	a.mu.Unlock()
+	if a.mStatus != nil {
+		a.mStatus.SetTitle("Error: " + msg)
+		systray.SetTooltip("RemoteAU — Error: " + msg)
+	}
+	a.notifySettingsError(msg)
+}
+
+// clearError drops a previously recorded error.
+func (a *app) clearError() {
+	a.mu.Lock()
+	a.lastError = ""
+	a.mu.Unlock()
+}
+
+// setSourceLabel remembers the applied capture source for diagnostics.
+func (a *app) setSourceLabel(label string) {
+	a.mu.Lock()
+	a.sourceLabel = label
+	a.mu.Unlock()
+}
+
+// setReceiverMuted mutes one live receiver.
+func (a *app) setReceiverMuted(id string, muted bool) {
+	a.mu.Lock()
+	host := a.host
+	a.mu.Unlock()
+	if host != nil {
+		host.SetMuted(id, muted)
+	}
+}
+
+// setReceiverVolume scales one live receiver's stream.
+func (a *app) setReceiverVolume(id string, volume float64) {
+	a.mu.Lock()
+	host := a.host
+	a.mu.Unlock()
+	if host != nil {
+		host.SetVolume(id, volume)
+	}
+}
+
+// forgetPeer removes a paired peer, preferring the live host (so any active
+// connection is torn down) and falling back to the trust store directly.
+func (a *app) forgetPeer(idHex string) {
+	a.mu.Lock()
+	host := a.host
+	a.mu.Unlock()
+	if host != nil {
+		if err := host.ForgetPeer(idHex); err != nil {
+			a.setError("forget: " + err.Error())
+			return
+		}
+		a.clearError()
+		return
+	}
+	raw, err := hex.DecodeString(idHex)
+	if err != nil || len(raw) != 16 {
+		a.setError("forget: invalid device id")
+		return
+	}
+	var id [16]byte
+	copy(id[:], raw)
+	if err := a.store.RemovePeer(id); err != nil {
+		a.setError("forget: " + err.Error())
+		return
+	}
+	a.clearError()
 }
 
 // MARK: receiver list
@@ -336,6 +509,13 @@ func (a *app) receiverRefresher() {
 		running := a.running
 		a.mu.Unlock()
 		if !running || host == nil {
+			if len(known) > 0 {
+				known = map[string]bool{}
+				for _, it := range a.receiverItems {
+					it.Hide()
+				}
+				a.receiverItems = nil
+			}
 			continue
 		}
 
@@ -360,8 +540,8 @@ func (a *app) receiverRefresher() {
 		// Update status line.
 		if len(current) > 0 {
 			r := current[0]
-			a.setStatus(fmt.Sprintf("Streaming to %s (%s, %.0f/%.0f/%.0f ms)",
-				r.Name, r.Codec, r.LossPct, r.JitterMs, r.RTTMs), "Stop streaming")
+			a.setStatus(fmt.Sprintf("Streaming to %s (%s, %s, %s, %.1f/%.1f/%.1f ms)",
+				r.Name, r.Codec, r.State, r.QualityMode, r.LossPct, r.JitterMs, r.RTTMs), "Stop streaming")
 		} else {
 			a.setStatus("Waiting for receivers…", "Stop streaming")
 		}
@@ -385,7 +565,7 @@ func (a *app) rebuildReceiverItems(receivers []engine.ReceiverInfo) {
 	}
 	for _, r := range receivers {
 		rCopy := r
-		label := fmt.Sprintf("%s — %s, %.0f/%.0f/%.0f ms", r.Name, r.Codec, r.LossPct, r.JitterMs, r.RTTMs)
+		label := fmt.Sprintf("%s — %s, %s, %s, %.1f/%.1f/%.1f ms", r.Name, r.Codec, r.State, r.QualityMode, r.LossPct, r.JitterMs, r.RTTMs)
 		item := a.mReceivers.AddSubMenuItemCheckbox(label, "Click to mute/unmute this receiver", r.Muted)
 		a.receiverItems = append(a.receiverItems, item)
 		go func(it *systray.MenuItem) {
@@ -406,7 +586,7 @@ func (a *app) rebuildReceiverItems(receivers []engine.ReceiverInfo) {
 // MARK: quality + source
 
 func (a *app) applyPreset(item *systray.MenuItem) {
-	var selected presetID
+	var selected presetID = presetAuto
 	for id, it := range a.qualityItems {
 		if it == item {
 			selected = id
@@ -415,23 +595,7 @@ func (a *app) applyPreset(item *systray.MenuItem) {
 		}
 	}
 	item.Check()
-	a.mu.Lock()
-	a.preset = selected
-	host := a.host
-	a.mu.Unlock()
-	if host == nil {
-		return
-	}
-	switch selected {
-	case presetLowest:
-		host.SetQuality(32000, 64000, false)
-	case presetLossless:
-		host.SetQuality(64000, 256000, false)
-	case presetRobust:
-		host.SetQuality(32000, 128000, true)
-	default:
-		host.SetQuality(32000, 256000, false)
-	}
+	a.applyPresetID(selected)
 }
 
 func (a *app) selectSource(index int, useDefault bool, item *systray.MenuItem) {
@@ -447,13 +611,16 @@ func (a *app) selectSource(index int, useDefault bool, item *systray.MenuItem) {
 	}
 	if useDefault {
 		_ = host.SetSourceDevice("")
+		a.setSourceLabel("System audio (default)")
 		return
 	}
 	lists, err := a.backend.EnumerateDevices()
 	if err != nil || index < 0 || index >= len(lists.Playback) {
 		return
 	}
-	_ = host.SetSourceDevice(lists.Playback[index].Name)
+	name := lists.Playback[index].Name
+	_ = host.SetSourceDevice(name)
+	a.setSourceLabel("Output: " + name)
 }
 
 // MARK: autostart

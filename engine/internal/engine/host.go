@@ -61,6 +61,10 @@ type HostOptions struct {
 	// OnPairingCode is invoked when an unpaired device starts pairing; the
 	// UI must display this code for the user to enter on the phone.
 	OnPairingCode func(code string)
+	// OnPairingInfo is invoked with the code AND a scannable pairing URL
+	// (remoteau://pair?...). UIs may show either; the URL carries the same
+	// code plus host/port/device id for QR pairing.
+	OnPairingInfo func(code, url string)
 	// OnReceiversChanged is invoked whenever the connected-receiver set or
 	// its stats change meaningfully (UI surface).
 	OnReceiversChanged func(receivers []ReceiverInfo)
@@ -94,6 +98,9 @@ type Host struct {
 	// pairMu serializes pairing exchanges (one code on screen at a time);
 	// later requests wait their turn instead of failing.
 	pairMu sync.Mutex
+
+	// listenPort is the actual bound v2 port (for pairing URLs).
+	listenPort int
 }
 
 // NewHost creates a host; call Run to start serving.
@@ -175,6 +182,11 @@ func (h *Host) Run(ctx context.Context) error {
 	}
 	defer func() { _ = listener.Close() }()
 	h.log.Infof("v2 host listening on %s as %q", listener.Addr(), h.opts.Name)
+	if udpAddr, ok := listener.Addr().(*net.UDPAddr); ok && udpAddr.Port > 0 {
+		h.mu.Lock()
+		h.listenPort = udpAddr.Port
+		h.mu.Unlock()
+	}
 
 	// Discovery responder (v2 announce includes the protocol version).
 	go func() {
@@ -885,6 +897,26 @@ func (h *Host) offerCaps() protocolv2.Caps {
 	}
 }
 
+// pairingURL builds the QR pairing URL shown on the PC:
+//
+//	remoteau://pair?v=2&h=<ip>&p=<port>&id=<deviceIDhex>&c=<code>
+func (h *Host) pairingURL(code string) string {
+	h.mu.Lock()
+	port := h.listenPort
+	h.mu.Unlock()
+	if port == 0 {
+		port = transportv2.DefaultPort
+	}
+	ip := primaryIPv4()
+	host := "0.0.0.0"
+	if ip.IsValid() && !ip.IsUnspecified() {
+		host = ip.String()
+	}
+	id := h.id.DeviceID()
+	return fmt.Sprintf("remoteau://pair?v=2&h=%s&p=%d&id=%s&c=%s",
+		host, port, hex.EncodeToString(id[:]), code)
+}
+
 // runPairing performs the v2 pairing handshake over the control stream. The
 // HOST displays a generated 6-digit PIN; the client user enters it. Pairings
 // are serialized: a second device waits for the first exchange to finish.
@@ -904,12 +936,18 @@ func (h *Host) runPairing(ctx context.Context, sess *session.Session) error {
 		return errors.New("expected pair-begin")
 	}
 
-	// Generate and surface the PIN.
+	// Generate and surface the PIN plus a scannable pairing URL. The URL
+	// carries only what the existing secure exchange needs (host, port,
+	// device id, and the same code) — nothing that weakens authentication.
 	code := generatePIN()
+	url := h.pairingURL(code)
 	if h.opts.OnPairingCode != nil {
 		h.opts.OnPairingCode(code)
 	}
-	h.log.Infof("pairing requested; enter code %s on the device", code)
+	if h.opts.OnPairingInfo != nil {
+		h.opts.OnPairingInfo(code, url)
+	}
+	h.log.Infof("pairing requested; enter code %s on the device (or scan the QR)", code)
 
 	ex, err := pairing.NewExchange(pairing.RoleSender, code, h.opts.Name)
 	if err != nil {

@@ -1,0 +1,68 @@
+name: Build Jailbreak Companion
+
+# Independent of the IPA workflow: this only builds the optional Theos tweak
+# package under jb/ and never touches ios/ or the Go engine.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "jb/**"
+      - ".github/workflows/build-jb.yml"
+
+jobs:
+  build-deb:
+    name: Build RemoteAU companion .deb
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential dpkg-dev fakeroot perl rsync curl zip xz-utils \
+            libxml2 libtinfo6 libz3-dev libplist-utils
+
+      - name: Clone Theos (with submodules)
+        run: |
+          set -euo pipefail
+          git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+
+      - name: Install Theos iOS toolchain (Linux)
+        run: |
+          set -euo pipefail
+          ARCH="$(uname -m)"
+          mkdir -p "$THEOS/toolchain"
+          curl -fsSL \
+            "https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-${ARCH}.tar.xz" \
+            | tar -xJ -C "$THEOS/toolchain"
+          test -x "$THEOS/toolchain/linux/iphone/bin/clang"
+
+      - name: Install iPhoneOS16.5 SDK
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/theos/sdks.git "$RUNNER_TEMP/theos-sdks"
+          git -C "$RUNNER_TEMP/theos-sdks" sparse-checkout set iPhoneOS16.5.sdk
+          mkdir -p "$THEOS/sdks"
+          cp -a "$RUNNER_TEMP/theos-sdks/iPhoneOS16.5.sdk" "$THEOS/sdks/"
+          test -d "$THEOS/sdks/iPhoneOS16.5.sdk"
+
+      - name: Build tweak package
+        working-directory: jb
+        run: |
+          set -euo pipefail
+          export PATH="$THEOS/toolchain/linux/iphone/bin:$PATH"
+          make clean || true
+          make package FINALPACKAGE=1
+          test -n "$(find packages -maxdepth 1 -name '*.deb' -print -quit)"
+
+      - name: Upload companion .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: remoteau-companion-deb
+          path: jb/packages/*.deb
+          if-no-files-found: error

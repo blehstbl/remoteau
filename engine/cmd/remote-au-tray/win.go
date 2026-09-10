@@ -51,8 +51,8 @@ func trayIconICO() []byte {
 		40, 0, 0, 0, // header size
 		size, 0, 0, 0, // width
 		size * 2, 0, 0, 0, // height (XOR + AND)
-		1, 0,       // planes
-		32, 0,      // bpp
+		1, 0, // planes
+		32, 0, // bpp
 		0, 0, 0, 0, // compression BI_RGB
 		0, 0, 0, 0, // image size (0 for BI_RGB)
 		0, 0, 0, 0, // x ppm
@@ -74,7 +74,7 @@ func trayIconICO() []byte {
 					corner = true
 				}
 			}
-			off := ((size - 1 - y)*size + x) * 4
+			off := ((size-1-y)*size + x) * 4
 			if corner {
 				// transparent
 				continue

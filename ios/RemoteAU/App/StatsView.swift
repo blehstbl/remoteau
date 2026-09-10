@@ -26,6 +26,7 @@ struct StatsView: View {
             row("Codec", stats.codec)
             row("Drift correction", String(format: "%+.3f %%", (stats.driftRatio - 1.0) * 100.0))
             row("Capture clock", String(format: "%.1f Hz", stats.captureFrameRateHz))
+            row("Capture-clock discontinuities", "\(stats.discontinuities)")
             Divider()
             row("Software latency (est.)", ms(stats.softwareLatencyMs))
             row("Output route", stats.outputRoute.isEmpty ? "—" : stats.outputRoute)

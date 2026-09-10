@@ -19,17 +19,22 @@ struct RootView: View {
     @AppStorage("v2BitrateKbps") private var v2BitrateKbps: Int = 128
     @AppStorage("v2FEC") private var v2FEC: Bool = false
     @AppStorage("v2DTX") private var v2DTX: Bool = false
+    @AppStorage("manualV2Host") private var manualV2Host: String = ""
+    @AppStorage("manualV2Port") private var manualV2Port: String = "47010"
+    @State private var manualError: String? = nil
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: Theme.spacingL) {
                     connectionHero
-                    if case .streaming = model.state {
+                    if isLive {
                         qualitySection
                         liveStatsSummary
                     }
                     discoveredSection
+                    manualConnectSection
+                    legacyFilterSection
                     pairedSection
                     errorFooter
                 }
@@ -99,13 +104,20 @@ struct RootView: View {
     private var connectionHero: some View {
         VStack(alignment: .leading, spacing: Theme.spacingM) {
             HStack(alignment: .center, spacing: Theme.spacingS) {
-                PulseDot(color: Theme.statusColor(for: model.state),
-                         active: isLive)
+                PulseDot(color: heroColor, active: isLive)
                 Text(heroTitle)
                     .font(.title2.weight(.semibold))
                     .accessibilityAddTraits(.isHeader)
                 Spacer()
-                if model.listening, case .streaming = model.state {
+                if v2Streaming {
+                    Button {
+                        v2.stop()
+                    } label: {
+                        Text("Disconnect")
+                            .font(.subheadline.weight(.medium))
+                    }
+                    .buttonStyle(.bordered)
+                } else if model.listening, case .streaming = model.state {
                     Button {
                         model.disconnect()
                     } label: {
@@ -113,6 +125,15 @@ struct RootView: View {
                             .font(.subheadline.weight(.medium))
                     }
                     .buttonStyle(.bordered)
+                }
+            }
+
+            if v2Active {
+                HStack(spacing: 6) {
+                    PulseDot(color: heroColor, active: true)
+                    Text("Secure session: \(v2.state)")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
                 }
             }
 
@@ -134,20 +155,26 @@ struct RootView: View {
                 .padding(.top, 4)
 
             case .waitingForSender:
-                Text("Searching for your PC on this Wi-Fi.\nOpen RemoteAU on the PC (tray app or `remote-au serve`) and tap it here, or start streaming to this iPhone directly.")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .padding(.top, 2)
+                if !v2Active {
+                    Text("Searching for your PC on this Wi-Fi.\nOpen RemoteAU on the PC (tray app or `remote-au serve`) and tap it here, or start streaming to this iPhone directly.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 2)
+                }
 
             case .interrupted(let reason):
-                Text(reason)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                if !v2Active {
+                    Text(reason)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
 
             case .idle:
-                Text("Receiver stopped.")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                if !v2Active {
+                    Text("Receiver stopped.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
         .padding(Theme.spacingL)
@@ -155,12 +182,38 @@ struct RootView: View {
         .accessibilityElement(children: .contain)
     }
 
+    private var v2Active: Bool {
+        !v2.state.isEmpty && v2.state != "idle" && v2.state != "unavailable"
+    }
+
+    private var v2Streaming: Bool {
+        v2.state == "streaming"
+    }
+
     private var isLive: Bool {
+        if v2Streaming { return true }
         if case .streaming = model.state { return true }
         return false
     }
 
+    private var heroColor: Color {
+        if v2Active {
+            return v2Streaming ? .green : .orange
+        }
+        return Theme.statusColor(for: model.state)
+    }
+
     private var heroTitle: String {
+        if v2Streaming { return "Connected" }
+        if v2Active {
+            switch v2.state {
+            case "connecting", "pairing": return "Connecting…"
+            case "buffering": return "Buffering…"
+            case "reconnecting": return "Reconnecting…"
+            case "error", "failed": return "Connection problem"
+            default: break
+            }
+        }
         switch model.state {
         case .idle: return "Receiver off"
         case .waitingForSender: return "Searching…"
@@ -270,27 +323,45 @@ struct RootView: View {
                 .font(.headline)
 
             if model.discoveredPeers.isEmpty {
-                HStack(spacing: Theme.spacingS) {
-                    Image(systemName: "desktopcomputer")
-                        .font(.title3)
-                        .foregroundStyle(.secondary)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("No PCs found yet")
-                            .font(.subheadline.weight(.medium))
-                        Text("Start the RemoteAU tray app (or `remote-au serve`) on the PC. You can also restrict incoming audio to one PC by IP:")
-                            .font(.footnote)
+                if !model.listening {
+                    VStack(alignment: .leading, spacing: Theme.spacingM) {
+                        HStack(spacing: Theme.spacingS) {
+                            Image(systemName: "stop.circle")
+                                .font(.title3)
+                                .foregroundStyle(.secondary)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Receiver stopped")
+                                    .font(.subheadline.weight(.medium))
+                                Text("Start the receiver to look for PCs on this Wi-Fi.")
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        Button {
+                            model.start()
+                            model.startFinder()
+                        } label: {
+                            Text("Start receiver")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                } else {
+                    HStack(spacing: Theme.spacingS) {
+                        Image(systemName: "desktopcomputer")
+                            .font(.title3)
                             .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("No PCs found yet")
+                                .font(.subheadline.weight(.medium))
+                            Text("Start the RemoteAU tray app (or `remote-au serve`) on the PC. If it still doesn't appear, use Connect manually below.")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
-                TextField("PC IP address, e.g. 192.168.1.10", text: $model.manualIPFilter)
-                    .textFieldStyle(.roundedBorder)
-                    .keyboardType(.decimalPad)
-                    .autocorrectionDisabled()
-                    .onChange(of: model.manualIPFilter) { v in
-                        storedIPFilter = v
-                    }
             } else {
-                ForEach(model.discoveredPeers) { peer in
+                ForEach(sortedPeers) { peer in
                     Button {
                         pairingPeer = peer
                     } label: {
@@ -300,6 +371,89 @@ struct RootView: View {
                     .accessibilityHint("Connect to this PC")
                 }
             }
+        }
+        .padding(Theme.spacingL)
+        .background(.background.secondary, in: RoundedRectangle(cornerRadius: Theme.cornerL))
+    }
+
+    /// Secure v2 peers first, then by name.
+    private var sortedPeers: [DiscoveredPeer] {
+        model.discoveredPeers.sorted { lhs, rhs in
+            let lhsV2 = lhs.protocolVersion >= 2
+            let rhsV2 = rhs.protocolVersion >= 2
+            if lhsV2 != rhsV2 { return lhsV2 }
+            return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+        }
+    }
+
+    // MARK: Manual v2 connect
+
+    private var manualConnectSection: some View {
+        VStack(alignment: .leading, spacing: Theme.spacingS) {
+            Text("Connect manually (secure v2)")
+                .font(.headline)
+            Text("Use this if the PC isn't discoverable. Pair with a code or scan its QR code.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            HStack(spacing: Theme.spacingS) {
+                TextField("Host, e.g. 192.168.1.10", text: $manualV2Host)
+                    .textFieldStyle(.roundedBorder)
+                    .keyboardType(.decimalPad)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                TextField("Port", text: $manualV2Port)
+                    .textFieldStyle(.roundedBorder)
+                    .keyboardType(.numberPad)
+                    .frame(width: 88)
+            }
+            if let manualError {
+                Label(manualError, systemImage: "exclamationmark.triangle")
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
+            }
+            Button {
+                connectManual()
+            } label: {
+                Text("Connect")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+        }
+        .padding(Theme.spacingL)
+        .background(.background.secondary, in: RoundedRectangle(cornerRadius: Theme.cornerL))
+    }
+
+    private func connectManual() {
+        let host = manualV2Host.trimmingCharacters(in: .whitespaces)
+        guard !host.isEmpty else {
+            manualError = "Enter the PC's IP address or hostname."
+            return
+        }
+        guard let port = Int(manualV2Port), (1...65535).contains(port) else {
+            manualError = "Enter a valid port (1-65535)."
+            return
+        }
+        manualError = nil
+        pairingPeer = DiscoveredPeer(name: host, address: host, port: port,
+                                     protocolVersion: 2, paired: false)
+    }
+
+    // MARK: Legacy v1 filter
+
+    private var legacyFilterSection: some View {
+        VStack(alignment: .leading, spacing: Theme.spacingS) {
+            Text("Legacy (v1) filter")
+                .font(.headline)
+            TextField("PC IP address, e.g. 192.168.1.10", text: $model.manualIPFilter)
+                .textFieldStyle(.roundedBorder)
+                .keyboardType(.decimalPad)
+                .autocorrectionDisabled()
+                .onChange(of: model.manualIPFilter) { v in
+                    storedIPFilter = v
+                }
+            Text("Legacy v1 PCs stream TO this iPhone; this field optionally restricts which PC is accepted. Secure v2 hosts connect from this screen instead.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
         }
         .padding(Theme.spacingL)
         .background(.background.secondary, in: RoundedRectangle(cornerRadius: Theme.cornerL))
@@ -354,9 +508,17 @@ struct RootView: View {
     }
 
     private var errorFooter: some View {
-        Group {
+        VStack(spacing: Theme.spacingS) {
             if let err = model.lastError {
                 Label(err, systemImage: "exclamationmark.triangle.fill")
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
+                    .padding(Theme.spacingM)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.background.secondary, in: RoundedRectangle(cornerRadius: Theme.cornerM))
+            }
+            if !v2.lastError.isEmpty {
+                Label(v2.lastError, systemImage: "exclamationmark.triangle.fill")
                     .font(.footnote)
                     .foregroundStyle(.orange)
                     .padding(Theme.spacingM)
@@ -380,6 +542,31 @@ struct PairingSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var pin = ""
     @State private var connecting = false
+    @State private var showScanner = false
+    @State private var linkError: String? = nil
+    @State private var scannedLink: PairingLink? = nil
+
+    /// `preScanned` lets callers seed the sheet from an already-parsed link
+    /// (e.g. a Universal Link or a manual entry). The discovered-peer path
+    /// initializes with it nil.
+    init(peer: DiscoveredPeer,
+         v2: V2Controller,
+         v2CodecOpus: Binding<Bool>,
+         v2FrameMs: Binding<Int>,
+         v2BitrateKbps: Binding<Int>,
+         v2FEC: Binding<Bool>,
+         v2DTX: Binding<Bool>,
+         preScanned: PairingLink? = nil) {
+        self.peer = peer
+        self._v2 = ObservedObject(wrappedValue: v2)
+        self._v2CodecOpus = v2CodecOpus
+        self._v2FrameMs = v2FrameMs
+        self._v2BitrateKbps = v2BitrateKbps
+        self._v2FEC = v2FEC
+        self._v2DTX = v2DTX
+        self._scannedLink = State(initialValue: preScanned)
+        self._pin = State(initialValue: preScanned?.code ?? "")
+    }
 
     var body: some View {
         NavigationStack {
@@ -387,62 +574,15 @@ struct PairingSheet: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(peer.name)
                         .font(.title3.weight(.semibold))
-                    Text("\(peer.address):\(peer.port) · protocol v\(peer.protocolVersion)")
+                    Text("\(targetHost) · protocol v\(peer.protocolVersion)")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
 
                 if peer.protocolVersion >= 2 {
-                    Text("Enter the pairing code shown on the PC to connect securely.")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                    TextField("6-digit code", text: $pin)
-                        .textFieldStyle(.roundedBorder)
-                        .keyboardType(.numberPad)
-                        .font(.title2.monospacedDigit())
-                        .multilineTextAlignment(.center)
-
-                    Button {
-                        connecting = true
-                        let adv = V2Controller.AdvancedSettings(
-                            codecOpus: v2CodecOpus,
-                            frameMs: v2FrameMs,
-                            bitrateKbps: v2BitrateKbps,
-                            fec: v2FEC,
-                            dtx: v2DTX
-                        )
-                        v2.connect(host: "\(peer.address):\(peer.port)",
-                                   name: Self.deviceName(),
-                                   advanced: adv) { code in
-                            // Prompt (defensive fallback if the sheet input
-                            // wasn't the path used).
-                            return code.isEmpty ? pin : code
-                        }
-                    } label: {
-                        if connecting {
-                            ProgressView()
-                        } else {
-                            Text("Connect")
-                                .frame(maxWidth: .infinity)
-                        }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(pin.count < 4 || connecting)
-
-                    if !v2.lastError.isEmpty {
-                        Label(v2.lastError, systemImage: "exclamationmark.triangle")
-                            .font(.footnote)
-                            .foregroundStyle(.orange)
-                    }
+                    v2ConnectControls
                 } else {
-                    Text("This PC speaks the legacy protocol. On the PC, start streaming and it will find this iPhone automatically:")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                    Text("remote-au send --source loopback --to \(peer.address):47000")
-                        .font(.footnote.monospaced())
-                        .textSelection(.enabled)
-                        .padding(8)
-                        .background(Color(.tertiarySystemFill), in: RoundedRectangle(cornerRadius: 8))
+                    legacyGuidance
                 }
 
                 Spacer()
@@ -458,7 +598,138 @@ struct PairingSheet: View {
                     }
                 }
             }
+            .sheet(isPresented: $showScanner) {
+                scannerSheet
+            }
         }
+    }
+
+    // MARK: v2 branch
+
+    @ViewBuilder
+    private var v2ConnectControls: some View {
+        if connecting {
+            VStack(spacing: Theme.spacingS) {
+                ProgressView()
+                Text("Pairing…")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, Theme.spacingL)
+        } else {
+            Text("Enter the pairing code shown on the PC, or scan its QR code to connect securely.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            TextField("Pairing code", text: $pin)
+                .textFieldStyle(.roundedBorder)
+                .keyboardType(.numberPad)
+                .font(.title2.monospacedDigit())
+                .multilineTextAlignment(.center)
+                .accessibilityLabel("Pairing code")
+
+            Button {
+                connect()
+            } label: {
+                Text("Connect")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(pin.count < 4)
+
+            Button {
+                linkError = nil
+                showScanner = true
+            } label: {
+                Label("Scan QR Code", systemImage: "qrcode.viewfinder")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .accessibilityLabel("Scan pairing QR code")
+        }
+
+        if let linkError {
+            Label(linkError, systemImage: "exclamationmark.triangle")
+                .font(.footnote)
+                .foregroundStyle(.orange)
+        }
+        if !v2.lastError.isEmpty {
+            Label(v2.lastError, systemImage: "exclamationmark.triangle")
+                .font(.footnote)
+                .foregroundStyle(.orange)
+        }
+    }
+
+    private var legacyGuidance: some View {
+        Group {
+            Text("This PC speaks the legacy protocol. On the PC, start streaming and it will find this iPhone automatically:")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            Text("remote-au send --source loopback --to \(peer.address):47000")
+                .font(.footnote.monospaced())
+                .textSelection(.enabled)
+                .padding(8)
+                .background(Color(.tertiarySystemFill), in: RoundedRectangle(cornerRadius: 8))
+        }
+    }
+
+    private var scannerSheet: some View {
+        NavigationStack {
+            QRScannerView { raw in
+                handleScan(raw)
+            }
+            .ignoresSafeArea()
+            .navigationTitle("Scan QR code")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        showScanner = false
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: Actions
+
+    private func handleScan(_ raw: String) {
+        showScanner = false
+        guard let link = PairingLink.parse(raw) else {
+            linkError = "Not a RemoteAU QR code"
+            return
+        }
+        linkError = nil
+        scannedLink = link
+        pin = link.code
+        UIAccessibility.post(notification: .announcement,
+                             argument: "Pairing code scanned. Connecting.")
+        connect()
+    }
+
+    private func connect() {
+        connecting = true
+        let adv = V2Controller.AdvancedSettings(
+            codecOpus: v2CodecOpus,
+            frameMs: v2FrameMs,
+            bitrateKbps: v2BitrateKbps,
+            fec: v2FEC,
+            dtx: v2DTX
+        )
+        // `pinPrompt` is `() async -> String`; the code (typed or scanned)
+        // is already seeded into `pin`, so this resolves immediately.
+        v2.connect(host: targetHost,
+                   name: Self.deviceName(),
+                   advanced: adv) {
+            return pin
+        }
+    }
+
+    private var targetHost: String {
+        if let link = scannedLink {
+            return "\(link.host):\(link.port)"
+        }
+        return "\(peer.address):\(peer.port)"
     }
 
     static func deviceName() -> String {
@@ -515,11 +786,12 @@ struct DeviceCard: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            Text(peer.protocolVersion >= 2 ? "Tap to pair" : "Legacy")
+            Text(peer.protocolVersion >= 2 ? "Tap to pair" : "Legacy / unencrypted")
                 .font(.caption.weight(.medium))
+                .foregroundStyle(peer.protocolVersion >= 2 ? Color.green : Color.secondary)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
-                .background(peer.protocolVersion >= 2 ? Color.green.opacity(0.15) : Color.blue.opacity(0.12),
+                .background(peer.protocolVersion >= 2 ? Color.green.opacity(0.15) : Color.gray.opacity(0.18),
                             in: Capsule())
         }
         .padding(Theme.spacingM)

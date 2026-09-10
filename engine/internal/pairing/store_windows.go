@@ -31,7 +31,11 @@ func NewWindowsStore() (*WindowsStore, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve config dir: %w", err)
 	}
-	dir := filepath.Join(appdata, "RemoteAU")
+	return newWindowsStoreAt(filepath.Join(appdata, "RemoteAU"))
+}
+
+// newWindowsStoreAt opens a store rooted at dir (used by tests).
+func newWindowsStoreAt(dir string) (*WindowsStore, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
@@ -72,7 +76,14 @@ func (s *WindowsStore) LoadIdentity() (*Identity, error) {
 	}
 	pkcs8, err := dpapiUnprotect(s.state.IdentityPKCS8)
 	if err != nil {
-		return nil, fmt.Errorf("dpapi unprotect identity: %w", err)
+		// Self-heal: an identity we cannot decrypt (e.g. copied from another
+		// user profile or corrupted) must not brick startup. Preserve it for
+		// forensics and report "no identity" so a fresh one is generated.
+		corrupt := s.path() + ".corrupt"
+		_ = os.Rename(s.path(), corrupt)
+		s.state.IdentityPKCS8 = nil
+		s.state.Peers = nil
+		return nil, nil
 	}
 	return LoadIdentity(pkcs8)
 }
@@ -174,9 +185,15 @@ func dpapiUnprotect(blob []byte) ([]byte, error) {
 	}
 	in := dataBlob{cbData: uint32(len(blob)), pbData: &blob[0]}
 	var out dataBlob
+	// CryptUnprotectData(pDataIn, ppszDataDescr, pOptionalEntropy,
+	//                     pvReserved, pPromptStruct, dwFlags, pDataOut)
 	hr, _, _ := procCryptUnprotect.Call(
 		uintptr(unsafe.Pointer(&in)),
-		0, 0, 0, 0,
+		0, // ppszDataDescr
+		0, // pOptionalEntropy
+		0, // pvReserved
+		0, // pPromptStruct
+		0, // dwFlags
 		uintptr(unsafe.Pointer(&out)),
 	)
 	if hr == 0 {

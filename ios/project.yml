@@ -33,8 +33,15 @@ targets:
         NSLocalNetworkUsageDescription:
           RemoteAU needs local network access to find and stream audio from
           your PC on the same Wi-Fi.
+        NSCameraUsageDescription:
+          RemoteAU uses the camera only to scan a pairing QR code shown on
+          your PC.
         UIUserInterfaceStyle: Automatic
         ITSAppUsesNonExemptEncryption: false
+        CFBundleURLTypes:
+          - CFBundleURLName: dev.remoteau.pair
+            CFBundleURLSchemes:
+              - remoteau
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.remoteau.app
