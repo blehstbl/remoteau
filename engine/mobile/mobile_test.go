@@ -110,6 +110,27 @@ func (s *testStateSink) OnState(j string) {
 	}
 }
 
+type testStatsSink struct{ ch chan string }
+
+func (s *testStatsSink) OnStats(j string) {
+	select {
+	case s.ch <- j:
+	default:
+	}
+}
+
+func TestSetSourceAndQualityModeGuards(t *testing.T) {
+	// Runs before any Setup in this package: the store is nil and there is
+	// no client, so the control calls must fail fast rather than panic.
+	Stop()
+	if err := SetSource(1, "Speakers"); err == nil {
+		t.Fatal("SetSource succeeded before Setup / while disconnected")
+	}
+	if err := SetQualityMode(2); err == nil {
+		t.Fatal("SetQualityMode succeeded before Setup / while disconnected")
+	}
+}
+
 func TestMobileSetupAndStore(t *testing.T) {
 	dir := t.TempDir()
 	if err := Setup(dir); err != nil {
@@ -173,6 +194,79 @@ func TestMobileConnectFlow(t *testing.T) {
 	if IsRunning() {
 		t.Fatal("still running after stop")
 	}
+}
+
+func TestMobileStatsFlow(t *testing.T) {
+	// Start a v2 host (fake capture) on its own port.
+	addr := "127.0.0.1:47202"
+	format := audio.Format{Rate: 48000, Channels: 2, FrameSamples: 480}
+	pinCh := make(chan string, 1)
+
+	host, err := engine.NewHost(engine.HostOptions{
+		Name: "MOBILE-PC-STATS", Store: &memStore{}, Backend: newFakeBackend(format),
+		ListenAddr: addr, Format: format, Logger: logging.Nop(),
+		OnPairingCode: func(code string) { pinCh <- code },
+	})
+	if err != nil {
+		t.Fatalf("host: %v", err)
+	}
+	hostCtx, stopHost := context.WithCancel(context.Background())
+	defer stopHost()
+	go func() { _ = host.Run(hostCtx) }()
+	time.Sleep(300 * time.Millisecond)
+
+	dir := t.TempDir()
+	if err := Setup(dir); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	media := &sink{ch: make(chan []byte, 64)}
+	SetMediaSink(media)
+	SetStateSink(&testStateSink{ch: make(chan string, 64)})
+	stats := &testStatsSink{ch: make(chan string, 64)}
+	SetStatsSink(stats)
+
+	pins := asyncPIN{get: func() string { return <-pinCh }}
+	if err := Connect(addr, "TestPhone", pins); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+
+	select {
+	case <-media.ch:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no media received")
+	}
+
+	// Let the ~1 Hz mobile stats ticker publish at least once.
+	time.Sleep(1500 * time.Millisecond)
+
+	raw := LatestStats()
+	var m map[string]any
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		t.Fatalf("latest stats not JSON: %v (%s)", err, raw)
+	}
+	if connected, _ := m["connected"].(bool); !connected {
+		t.Fatalf("latest stats connected != true: %s", raw)
+	}
+	if _, ok := m["jitter_ms"].(float64); !ok {
+		t.Fatalf("latest stats jitter_ms missing/not numeric: %s", raw)
+	}
+
+	select {
+	case j := <-stats.ch:
+		var sm map[string]any
+		if err := json.Unmarshal([]byte(j), &sm); err != nil {
+			t.Fatalf("stats sink not JSON: %v (%s)", err, j)
+		}
+		if _, ok := sm["state"]; !ok {
+			t.Fatalf("stats sink payload missing state: %s", j)
+		}
+	default:
+		t.Fatal("no stats published to StatsSink")
+	}
+
+	Stop()
+	time.Sleep(200 * time.Millisecond)
 }
 
 // ---------------------------------------------------------------------------

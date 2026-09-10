@@ -25,10 +25,12 @@ QUIC (TLS 1.3) with QUIC DATAGRAM extension (RFC 9221):
   fingerprint); the receiver only trusts fingerprints it paired with (or
   explicitly accepts in legacy/trust-first mode).
 
-Fallback transport (same messages, different carrier): UDP with per-packet
-AES-256-GCM using keys derived from the pairing secret. Selected during
-capability exchange so an iOS build without QUIC datagram support can still do
-v2 securely.
+**Only QUIC (TLS 1.3) with the QUIC DATAGRAM extension is implemented today.**
+There is no second carrier in the code: a UDP transport with per-packet
+AES-256-GCM keys derived from the pairing secret is a *possible future
+transport*, not something that is built, negotiated, or selected — it is
+**not implemented**. The `transport/v2` package is the seam where such an
+alternative carrier would be added later.
 
 ## Control messages (little-endian)
 
@@ -57,6 +59,12 @@ Framing: `msgType:u16 | flags:u16 | requestId:u32 | payloadLen:u32 | payload`
 | 0x0081 | SET_SOURCE | recv→send | `{kind:u8 (0=default 1=render device by name 2=test tone 3=per-app), name:str16}` (kind 3: name = `p:<pid[,pid…]>` capture only those PIDs, or `x:<pid>` capture all but one PID; Windows only) |
 | 0x0082 | SET_SOURCE_ACK | send→recv | `{ok:u8, detail:str16}` |
 | 0x0083 | RECEIVER_STATE | recv→send | `{state:u8}` (0=connecting 1=pairing 2=buffering 3=playing 4=interrupted 5=reconnecting 6=stopped) |
+
+Implementation status: the messages wired end-to-end today are HELLO/HELLO_OK,
+PAIR_BEGIN/CHALLENGE/CONFIRM/RESULT, STREAM_START/ACK/STOP, FORMAT_UPDATE/ACK,
+STATS, VOLUME, PING/PONG, RESUME/RESUME_OK, QUALITY_MODE,
+SET_SOURCE/SET_SOURCE_ACK and RECEIVER_STATE. `STATS_ACK` (0x0041) is defined on
+the wire but is not sent or handled yet.
 
 SET_SOURCE kind 3 (per-app) is host-authoritative: the host validates the PID
 list (PIDs > 0, exclude mode limited to one PID — Windows takes a single

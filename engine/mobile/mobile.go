@@ -38,6 +38,11 @@ type StateSink interface {
 	OnState(jsonState string)
 }
 
+// StatsSink receives JSON measurement snapshots (~1 Hz) while connected.
+type StatsSink interface {
+	OnStats(jsonStats string)
+}
+
 // RequestSource is asked (on a Go goroutine) for the pairing PIN the user
 // read from the PC screen. Returning an empty string cancels pairing.
 type RequestSource interface {
@@ -60,6 +65,7 @@ var (
 
 	mediaSink MediaSink
 	stateSink StateSink
+	statsSink StatsSink
 	logLevel  = "info"
 )
 
@@ -174,6 +180,41 @@ func SetStateSink(s StateSink) {
 	mu.Unlock()
 }
 
+// SetStatsSink registers the live measurement sink (JSON, ~1 Hz).
+func SetStatsSink(s StatsSink) {
+	mu.Lock()
+	statsSink = s
+	mu.Unlock()
+}
+
+// SetSource asks the host to switch its capture source. kind: 0=system
+// default, 1=named render device, 2=test tone, 3=per-app (name "p:1,2" or
+// "x:9"). Values outside 0..3 are clamped.
+func SetSource(kind int, name string) error {
+	mu.Lock()
+	c := client
+	run := running
+	mu.Unlock()
+	if !run || c == nil {
+		return errors.New("mobile: not connected")
+	}
+	return c.SetSource(uint8(clampInt(kind, 0, 3)), name)
+}
+
+// SetQualityMode asks the host to apply a quality preset. mode: 0=auto,
+// 1=lowest, 2=lossless, 3=robust, 4=advanced. Values outside 0..4 are
+// clamped.
+func SetQualityMode(mode int) error {
+	mu.Lock()
+	c := client
+	run := running
+	mu.Unlock()
+	if !run || c == nil {
+		return errors.New("mobile: not connected")
+	}
+	return c.SetQualityMode(uint8(clampInt(mode, 0, 4)))
+}
+
 // SetLogLevel sets the engine log verbosity ("debug", "info", "warn").
 func SetLogLevel(level string) {
 	mu.Lock()
@@ -216,6 +257,8 @@ func ConnectWithCaps(hostAddr, deviceName string, codecID, rate, channels, frame
 	setState("connecting")
 	ctx, ctxCancel := context.WithCancel(context.Background())
 	cancel = ctxCancel
+	statsDone := make(chan struct{})
+	go statsLoop(ctx, statsDone)
 
 	requested := protocolv2.Caps{
 		Codec:       uint8(clampInt(codecID, 0, 1)),
@@ -249,6 +292,7 @@ func ConnectWithCaps(hostAddr, deviceName string, codecID, rate, channels, frame
 	}
 
 	go func() {
+		defer close(statsDone)
 		defer func() {
 			mu.Lock()
 			running = false
@@ -440,9 +484,60 @@ func publishState() {
 	}
 }
 
-// publishStats is called by the stats ticker in the client loop (wired via
-// the state sink payload in future revisions).
-func publishStats() { publishState() }
+// statsLoop periodically publishes a measurement snapshot while the connect
+// lifecycle is active. It exits when the lifecycle goroutine closes done (or
+// the context is cancelled) and never blocks callers.
+func statsLoop(ctx context.Context, done <-chan struct{}) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-done:
+			return
+		case <-ticker.C:
+			publishStats()
+		}
+	}
+}
+
+// publishStats merges the client's live measurements with the mobile state
+// and publishes the result to LatestStats() and the stats sink (~1 Hz). When
+// no client is connected it publishes a disconnected snapshot.
+func publishStats() {
+	mu.Lock()
+	c := client
+	s := state
+	run := running
+	sink := statsSink
+	mu.Unlock()
+
+	var out string
+	if c != nil {
+		snap := map[string]any{}
+		if err := json.Unmarshal([]byte(c.StatsJSON()), &snap); err != nil || snap == nil {
+			snap = map[string]any{}
+		}
+		snap["state"] = s
+		snap["connected"] = run
+		b, err := json.Marshal(snap)
+		if err != nil {
+			return
+		}
+		out = string(b)
+	} else {
+		b, _ := json.Marshal(map[string]any{"state": s, "connected": false})
+		out = string(b)
+	}
+
+	mu.Lock()
+	latestStatsJSON = out
+	mu.Unlock()
+	if sink != nil {
+		sink.OnStats(out)
+	}
+}
 
 func newLogger() logging.Logger {
 	mu.Lock()

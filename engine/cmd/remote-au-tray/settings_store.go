@@ -14,10 +14,12 @@ var saveMu sync.Mutex
 // persistedSettings is the on-disk schema for
 // %AppData%\RemoteAU\settings.json.
 type persistedSettings struct {
-	AutoStream   bool   `json:"auto_stream"`
-	LastReceiver string `json:"last_receiver"`
-	Preset       string `json:"preset"`
-	Muted        bool   `json:"muted"`
+	AutoStream     bool   `json:"auto_stream"`
+	LastReceiver   string `json:"last_receiver"`
+	Preset         string `json:"preset"`
+	Profile        string `json:"profile"`
+	AutoReceiverID string `json:"auto_receiver_id"`
+	Muted          bool   `json:"muted"`
 }
 
 // settingsPath returns %AppData%\RemoteAU\settings.json, creating the
@@ -56,10 +58,12 @@ func loadSettings() (persistedSettings, bool) {
 func (a *app) saveSettings() {
 	a.mu.Lock()
 	s := persistedSettings{
-		AutoStream:   a.autoStream,
-		LastReceiver: a.lastReceiver,
-		Preset:       presetName(a.preset),
-		Muted:        a.muted,
+		AutoStream:     a.autoStream,
+		LastReceiver:   a.lastReceiver,
+		Preset:         presetName(a.preset),
+		Profile:        profileName(a.profile),
+		AutoReceiverID: a.autoReceiverID,
+		Muted:          a.muted,
 	}
 	a.mu.Unlock()
 

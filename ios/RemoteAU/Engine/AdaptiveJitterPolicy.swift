@@ -56,6 +56,11 @@ struct AdaptiveJitterPolicy {
 
     // Internal state (ms).
     private(set) var currentTargetMs: Double
+    /// Lower/upper clamp for the target (set from Advanced in the UI). The
+    /// Auto policy never buffers below `minMs` or above `maxMs`; fixed
+    /// presets and the manual Advanced target are clamped into range too.
+    private(set) var minMs: Double = 8
+    private(set) var maxMs: Double = 400
     /// Advisory only (for the v2 engine path): suggests enabling FEC while
     /// loss arrives in bursts or at a high rate. Updated with hysteresis in
     /// update().
@@ -99,8 +104,8 @@ struct AdaptiveJitterPolicy {
         let profile = preset.profile
         switch preset {
         case .lowestLatency, .lossless, .robust:
-            // Fixed presets: clamp within [min, ceiling], start at profile.
-            currentTargetMs = profile.targetMs
+            // Fixed presets: pin the profile target, clamped to user bounds.
+            currentTargetMs = min(max(profile.targetMs, minMs), maxMs)
             return currentTargetMs
         case .advanced:
             return currentTargetMs // manual target set by UI
@@ -108,8 +113,13 @@ struct AdaptiveJitterPolicy {
             break
         }
 
-        let ceiling = profile.ceilingMs
-        let floorMs = Self.minimumMs
+        // Auto: the effective ceiling is the tighter of the profile ceiling
+        // and the user's max; the floor is the user's min.
+        let ceiling = min(profile.ceilingMs, maxMs)
+        let floorMs = minMs
+
+        // Never let a stale target (or a bounds change) sit outside range.
+        currentTargetMs = min(max(currentTargetMs, minMs), maxMs)
 
         // Required target from observed conditions (with headroom).
         var required = floorMs
@@ -120,6 +130,7 @@ struct AdaptiveJitterPolicy {
         // one hit, so each packet of the longest recent burst adds ~4 ms.
         required += Double(min(max(net.maxBurst, 0), 8)) * 4.0
         required += net.bufferDepthMs * 0.15 // mild feedback from buffer state
+        required = min(max(required, minMs), maxMs)
 
         if lastChange == 0 {
             lastChange = now
@@ -146,17 +157,30 @@ struct AdaptiveJitterPolicy {
         return currentTargetMs
     }
 
-    /// Manual override (Advanced).
+    /// Manual override (Advanced). The manual target wins for the Advanced
+    /// preset, so it is allowed outside the Auto bounds but is still kept in
+    /// the engine's hard [minimumMs, 400] ms window.
     private(set) var manualTargetMs: Double = 20
     mutating func setManualTarget(ms: Double) {
         manualTargetMs = max(Self.minimumMs, min(400, ms))
         currentTargetMs = manualTargetMs
     }
 
+    /// Advanced bounds. Clamps so `minMs >= 4`, `maxMs <= 400` and
+    /// `maxMs >= minMs`, then pulls the current target into range.
+    mutating func setBounds(minMs: Double, maxMs: Double) {
+        let lo = max(4.0, min(400.0, minMs))
+        let hi = max(lo, min(400.0, maxMs))
+        self.minMs = lo
+        self.maxMs = hi
+        if currentTargetMs < lo { currentTargetMs = lo }
+        if currentTargetMs > hi { currentTargetMs = hi }
+    }
+
     var activeTargetMs: Double { currentTargetMs }
 
     mutating func reset() {
-        currentTargetMs = preset.profile.targetMs
+        currentTargetMs = min(max(preset.profile.targetMs, minMs), maxMs)
         lastChange = 0
         stableSince = 0
     }

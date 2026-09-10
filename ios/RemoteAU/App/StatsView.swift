@@ -53,3 +53,49 @@ struct StatsView: View {
         String(format: "%.1f ms", v)
     }
 }
+
+/// Compact live statistics for the secure v2 engine. Shown alongside (and
+/// independently of) the legacy v1 snapshot when the v2 session reports
+/// `connected`.
+struct V2StatsView: View {
+    var stats: V2Stats
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Secure session (v2)")
+                .font(.footnote.weight(.semibold))
+            row("State", stats.state.isEmpty ? "—" : stats.state)
+            row("Round-trip time", ms(stats.rttMs))
+            row("Packet loss", String(format: "%.2f %%", stats.lossPct))
+            row("Late", String(format: "%.2f %%", stats.latePct))
+            row("Network jitter", ms(stats.jitterMs))
+            row("Buffer", ms(stats.bufferMs))
+            row("Packets seen", whole(stats.packetsSeen))
+            row("Lost packets", whole(stats.lossPackets))
+            row("Late packets", whole(stats.latePackets))
+            row("Reordered packets", whole(stats.reorderedPackets))
+            row("Concealed frames", whole(stats.concealedFrames))
+            row("Longest loss burst", "\(whole(stats.maxBurst)) packets")
+        }
+        .font(.footnote)
+    }
+
+    private func row(_ title: String, _ value: String) -> some View {
+        HStack {
+            Text(title)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Text(value)
+                .monospacedDigit()
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private func ms(_ v: Double) -> String {
+        String(format: "%.1f ms", v)
+    }
+
+    private func whole(_ v: Double) -> String {
+        String(format: "%.0f", v)
+    }
+}

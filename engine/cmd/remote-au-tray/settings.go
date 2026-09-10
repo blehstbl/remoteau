@@ -29,12 +29,14 @@ type sourceChoice struct {
 // liveRow holds the per-receiver widgets so refreshes can update them in place
 // instead of rebuilding rows (which would interrupt slider/checkbox input).
 type liveRow struct {
+	app      *app
 	devID    string
 	row      *walk.Composite
 	name     *walk.Label
 	stats    *walk.Label
 	mute     *walk.CheckBox
 	vol      *walk.Slider
+	auto     *walk.CheckBox
 	updating bool
 }
 
@@ -45,6 +47,7 @@ type settingsUI struct {
 	mw  *walk.MainWindow
 
 	initializing bool
+	syncing      bool
 
 	// Source.
 	sourceChoices []sourceChoice
@@ -52,12 +55,20 @@ type settingsUI struct {
 	sourceTone    *walk.RadioButton
 	toneCombo     *walk.ComboBox
 
-	// Quality.
+	// Applications (per-app capture).
+	appBox  *walk.Composite
+	appNote *walk.Label
+	appRows []*walk.Composite
+
+	// Quality + profiles.
 	qualityRadios map[presetID]*walk.RadioButton
+	profileRadios map[profileID]*walk.RadioButton
 
 	// Auto-connect.
 	autoStream *walk.CheckBox
 	lastLabel  *walk.Label
+	autoLabel  *walk.Label
+	autoNone   *walk.PushButton
 
 	// Receivers.
 	peersBox *walk.Composite
@@ -84,6 +95,7 @@ func newSettingsUI(a *app) (*settingsUI, error) {
 		mw:            mw,
 		initializing:  true,
 		qualityRadios: map[presetID]*walk.RadioButton{},
+		profileRadios: map[profileID]*walk.RadioButton{},
 		liveRows:      map[string]*liveRow{},
 	}
 	_ = mw.SetTitle("RemoteAU — Settings")
@@ -138,6 +150,21 @@ func newSettingsUI(a *app) (*settingsUI, error) {
 	srcNote, _ := walk.NewLabel(srcGroup)
 	_ = srcNote.SetText("Tone mode is read when streaming starts; restart streaming to switch Sine/Click.")
 
+	_, _ = walk.NewHSeparator(srcGroup)
+	appsLbl, _ := walk.NewLabel(srcGroup)
+	_ = appsLbl.SetText("Applications (per-app capture)")
+	appsHeader, _ := walk.NewComposite(srcGroup)
+	_ = appsHeader.SetLayout(walk.NewHBoxLayout())
+	ui.appNote, _ = walk.NewLabel(appsHeader)
+	_ = ui.appNote.SetText("Loading audio sessions…")
+	_, _ = walk.NewHSpacer(appsHeader)
+	refreshAppsBtn, _ := walk.NewPushButton(appsHeader)
+	_ = refreshAppsBtn.SetText("Refresh")
+	refreshAppsBtn.Clicked().Attach(func() { ui.refreshApps() })
+	ui.appBox, _ = walk.NewComposite(srcGroup)
+	_ = ui.appBox.SetLayout(walk.NewVBoxLayout())
+	ui.refreshApps()
+
 	// --- Receivers ------------------------------------------------------
 	recvGroup, _ := walk.NewGroupBox(mw)
 	_ = recvGroup.SetTitle("Receivers")
@@ -172,6 +199,15 @@ func newSettingsUI(a *app) (*settingsUI, error) {
 	})
 	ui.lastLabel, _ = walk.NewLabel(acGroup)
 	_ = ui.lastLabel.SetText("Last connected: (none)")
+	ui.autoLabel, _ = walk.NewLabel(acGroup)
+	_ = ui.autoLabel.SetText("Preferred receiver: (none)")
+	ui.autoNone, _ = walk.NewPushButton(acGroup)
+	_ = ui.autoNone.SetText("None (clear preferred receiver)")
+	ui.autoNone.Clicked().Attach(func() { a.clearAutoReceiver() })
+	acHelp, _ := walk.NewLabel(acGroup)
+	_ = acHelp.SetText("Preference only: when Auto-stream is on, the host already streams to any " +
+		"trusted receiver. Tick a live receiver's \"Auto-connect\" box below; when that " +
+		"receiver connects it is surfaced in the status line as \"auto-connect receiver: <name>\".")
 
 	// --- Quality --------------------------------------------------------
 	qGroup, _ := walk.NewGroupBox(mw)
@@ -198,6 +234,28 @@ func newSettingsUI(a *app) (*settingsUI, error) {
 	} else {
 		ui.qualityRadios[presetAuto].SetChecked(true)
 	}
+
+	// --- Profiles -------------------------------------------------------
+	pGroup, _ := walk.NewGroupBox(mw)
+	_ = pGroup.SetTitle("Profiles")
+	_ = pGroup.SetLayout(walk.NewVBoxLayout())
+	for _, spec := range profileSpecs {
+		spec := spec
+		rb, _ := walk.NewRadioButton(pGroup)
+		_ = rb.SetText(spec.Name)
+		rb.CheckedChanged().Attach(func() {
+			if ui.initializing || ui.syncing || !rb.Checked() {
+				return
+			}
+			a.applyProfileID(spec.ID)
+		})
+		ui.profileRadios[spec.ID] = rb
+	}
+	pNote, _ := walk.NewLabel(pGroup)
+	_ = pNote.SetText("Profiles set both bitrate bounds and FEC for the stream; the Quality " +
+		"radios below choose bounds directly. Remote / Efficient hints that relay mode " +
+		"is used for WAN (serve --relay).")
+	ui.syncPresetRadios()
 
 	// --- Diagnostics ----------------------------------------------------
 	dGroup, _ := walk.NewGroupBox(mw)
@@ -328,13 +386,20 @@ func (ui *settingsUI) refresh() {
 	a.mu.Lock()
 	host := a.host
 	src := a.sourceLabel
+	apps := a.captureApps
 	errText := a.lastError
 	last := a.lastReceiver
+	hint := a.profileHint
+	autoID := a.autoReceiverID
+	prof := a.profile
 	a.mu.Unlock()
 
 	if errText != "" {
 		_ = ui.status.SetText("Error: " + errText)
 		ui.status.SetTextColor(walk.RGB(200, 0, 0))
+	} else if hint != "" {
+		_ = ui.status.SetText(hint)
+		ui.status.SetTextColor(walk.RGB(0, 80, 200))
 	} else {
 		_ = ui.status.SetText("Ready")
 		ui.status.SetTextColor(walk.RGB(0, 120, 0))
@@ -345,13 +410,52 @@ func (ui *settingsUI) refresh() {
 	} else {
 		_ = ui.lastLabel.SetText("Last connected: " + last)
 	}
+	_ = ui.autoLabel.SetText("Preferred receiver: " + ui.autoReceiverLabel(host, autoID))
 
-	_ = ui.diag.SetText(ui.diagnostics(host, src, errText))
+	ui.syncPresetRadios()
+	_ = ui.diag.SetText(ui.diagnostics(host, src, apps, errText, prof, autoID))
 	ui.syncLive(host)
 	ui.syncPeers()
 }
 
-func (ui *settingsUI) diagnostics(host *engine.Host, src, errText string) string {
+// autoReceiverLabel renders the preferred auto-connect receiver, preferring the
+// live receiver's name over the raw id.
+func (ui *settingsUI) autoReceiverLabel(host *engine.Host, id string) string {
+	if id == "" {
+		return "(none)"
+	}
+	if host != nil {
+		for _, r := range host.Receivers() {
+			if r.DeviceID == id {
+				return r.Name
+			}
+		}
+	}
+	if len(id) > 8 {
+		return id[:8] + " (not connected)"
+	}
+	return id + " (not connected)"
+}
+
+// syncPresetRadios mirrors app.preset/profile onto the radio groups without
+// re-triggering their apply handlers.
+func (ui *settingsUI) syncPresetRadios() {
+	a := ui.app
+	a.mu.Lock()
+	p := a.preset
+	prof := a.profile
+	a.mu.Unlock()
+	ui.syncing = true
+	defer func() { ui.syncing = false }()
+	for id, rb := range ui.qualityRadios {
+		rb.SetChecked(id == p)
+	}
+	for id, rb := range ui.profileRadios {
+		rb.SetChecked(id == prof)
+	}
+}
+
+func (ui *settingsUI) diagnostics(host *engine.Host, src, apps, errText string, prof profileID, autoID string) string {
 	var b strings.Builder
 	state := "stopped"
 	if host != nil {
@@ -367,6 +471,15 @@ func (ui *settingsUI) diagnostics(host *engine.Host, src, errText string) string
 	}
 	fmt.Fprintf(&b, "Engine:    %s\n", state)
 	fmt.Fprintf(&b, "Source:    %s\n", src)
+	if apps != "" {
+		fmt.Fprintf(&b, "Apps:      %s\n", apps)
+	}
+	pname := profileName(prof)
+	if pname == "" {
+		pname = "(custom)"
+	}
+	fmt.Fprintf(&b, "Profile:   %s\n", pname)
+	fmt.Fprintf(&b, "Auto-conn: %s\n", autoID)
 	if errText != "" {
 		fmt.Fprintf(&b, "Error:     %s\n", errText)
 	}
@@ -410,20 +523,107 @@ func (ui *settingsUI) applySource() {
 			return
 		}
 		a.setSourceLabel("Output: " + chosen.name)
+		a.setCaptureAppsLabel("")
 	case sourceTestTone:
 		if err := host.SetCaptureSource(audio.SourceTestTone); err != nil {
 			a.setError("source: " + err.Error())
 			return
 		}
 		a.setSourceLabel("Test tone")
+		a.setCaptureAppsLabel("")
 	default:
 		if err := host.SetSourceDevice(""); err != nil {
 			a.setError("source: " + err.Error())
 			return
 		}
 		a.setSourceLabel("System audio (default)")
+		a.setCaptureAppsLabel("")
 	}
 	a.clearError()
+}
+
+// refreshApps rebuilds the per-application list. It must run on the walk
+// thread; the backend enumeration happens on a locked background thread so the
+// UI never stalls and the walk thread's COM apartment is left untouched.
+func (ui *settingsUI) refreshApps() {
+	for _, row := range ui.appRows {
+		row.Dispose()
+	}
+	ui.appRows = nil
+	_ = ui.appNote.SetText("Refreshing audio sessions…")
+
+	a := ui.app
+	lister, ok := a.backend.(audio.ProcessLister)
+	if !ok {
+		_ = ui.appNote.SetText("Per-app capture is not supported by this audio backend.")
+		return
+	}
+	go func() {
+		procs, err := lister.ListAudioProcesses()
+		ui.mw.Synchronize(func() { ui.populateApps(procs, err) })
+	}()
+}
+
+// populateApps renders the per-application rows on the walk thread.
+func (ui *settingsUI) populateApps(procs []audio.AudioProcessInfo, err error) {
+	for _, row := range ui.appRows {
+		row.Dispose()
+	}
+	ui.appRows = nil
+	if err != nil {
+		_ = ui.appNote.SetText("Could not list audio processes: " + err.Error())
+		return
+	}
+	if len(procs) == 0 {
+		_ = ui.appNote.SetText("No active audio sessions found. Start playback in an app, then Refresh.")
+		return
+	}
+	_ = ui.appNote.SetText(fmt.Sprintf("%d active audio process(es). \"Only\" captures just that app; \"Exclude\" captures everything else.", len(procs)))
+	for _, p := range procs {
+		p := p
+		name := p.Name
+		if name == "" {
+			name = "(unknown)"
+		}
+		row, _ := walk.NewComposite(ui.appBox)
+		_ = row.SetLayout(walk.NewHBoxLayout())
+		lbl, _ := walk.NewLabel(row)
+		_ = lbl.SetText(fmt.Sprintf("%s  [PID %d]", name, p.PID))
+		_, _ = walk.NewHSpacer(row)
+		only, _ := walk.NewPushButton(row)
+		_ = only.SetText("Only")
+		only.Clicked().Attach(func() { ui.applyCaptureApps([]uint32{p.PID}, false, name) })
+		excl, _ := walk.NewPushButton(row)
+		_ = excl.SetText("Exclude")
+		excl.Clicked().Attach(func() { ui.applyCaptureApps([]uint32{p.PID}, true, name) })
+		ui.appRows = append(ui.appRows, row)
+	}
+}
+
+// applyCaptureApps applies a per-application capture selection. SetCaptureApps
+// closes and reopens the capture stream, so the note spells that out.
+func (ui *settingsUI) applyCaptureApps(pids []uint32, exclude bool, name string) {
+	a := ui.app
+	a.mu.Lock()
+	host := a.host
+	a.mu.Unlock()
+	if host == nil {
+		a.setError("start streaming before choosing an application source")
+		return
+	}
+	if err := host.SetCaptureApps(pids, exclude); err != nil {
+		a.setError("per-app source: " + err.Error())
+		return
+	}
+	if exclude {
+		a.setCaptureAppsLabel("Exclude " + name)
+	} else {
+		a.setCaptureAppsLabel("Only " + name)
+	}
+	a.setSourceLabel("Application: " + name)
+	a.clearError()
+	ui.setStatusText("Applied per-app source ("+a.captureAppsLabel()+"). Capture restarted.", false)
+	ui.refreshApps()
 }
 
 // syncLive creates/updates/removes one row per connected receiver.
@@ -469,8 +669,10 @@ func (ui *settingsUI) addLiveRow(r engine.ReceiverInfo) *liveRow {
 	vol, _ := walk.NewSlider(bot)
 	vol.SetRange(0, 200)
 	_ = vol.SetMinMaxSize(walk.Size{Width: 200}, walk.Size{Width: 200})
+	auto, _ := walk.NewCheckBox(bot)
+	_ = auto.SetText("Auto-connect")
 
-	lr := &liveRow{devID: r.DeviceID, row: row, name: name, stats: stats, mute: mute, vol: vol}
+	lr := &liveRow{app: ui.app, devID: r.DeviceID, row: row, name: name, stats: stats, mute: mute, vol: vol, auto: auto}
 	mute.CheckedChanged().Attach(func() {
 		if lr.updating {
 			return
@@ -482,6 +684,16 @@ func (ui *settingsUI) addLiveRow(r engine.ReceiverInfo) *liveRow {
 			return
 		}
 		ui.app.setReceiverVolume(lr.devID, float64(vol.Value())/100.0)
+	})
+	auto.CheckedChanged().Attach(func() {
+		if lr.updating {
+			return
+		}
+		if auto.Checked() {
+			ui.app.setAutoReceiver(lr.devID)
+		} else {
+			ui.app.clearAutoReceiverIf(lr.devID)
+		}
 	})
 	return lr
 }
@@ -498,6 +710,10 @@ func (lr *liveRow) update(r engine.ReceiverInfo) {
 	v := int(r.Volume*100 + 0.5)
 	if lr.vol.Value() != v {
 		lr.vol.SetValue(v)
+	}
+	want := lr.app.autoReceiver() == lr.devID
+	if lr.auto.Checked() != want {
+		lr.auto.SetChecked(want)
 	}
 }
 

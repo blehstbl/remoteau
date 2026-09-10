@@ -1,6 +1,24 @@
 import Foundation
 import SwiftUI
 
+/// Decoded v2 engine statistics (JSON emitted by `RemoteAULatestStats` /
+/// the stats sink). All fields default so a blank value always compiles.
+struct V2Stats: Equatable {
+    var state: String = ""
+    var connected: Bool = false
+    var rttMs: Double = 0
+    var lossPct: Double = 0
+    var latePct: Double = 0
+    var jitterMs: Double = 0
+    var bufferMs: Double = 0
+    var packetsSeen: Double = 0
+    var lossPackets: Double = 0
+    var latePackets: Double = 0
+    var reorderedPackets: Double = 0
+    var concealedFrames: Double = 0
+    var maxBurst: Double = 0
+}
+
 /// Swift bridge to the Go v2 engine (RemoteAU.xcframework via gomobile).
 /// Everything here compiles to no-ops when the framework is not linked, so
 /// the v1-only build stays intact.
@@ -32,6 +50,21 @@ final class GoStateSink: NSObject, RemoteAUStateSink {
     func onState(_ jsonState: String?) {
         guard let jsonState else { return }
         onState(jsonState)
+    }
+}
+
+final class GoStatsSink: NSObject, RemoteAUStatsSink {
+    let onStats: (String) -> Void
+
+    init(onStats: @escaping (String) -> Void) {
+        self.onStats = onStats
+    }
+
+    // gomobile imports the Go `string` parameter as an optional, exactly like
+    // GoStateSink.onState(_:) and GoMediaSink.onMedia(_:) above.
+    func onStats(_ json: String?) {
+        guard let json else { return }
+        onStats(json)
     }
 }
 
@@ -191,8 +224,11 @@ final class V2Controller: ObservableObject {
     @Published var state: String = "idle"
     @Published var lastError: String = ""
     @Published var pairedPeers: String = "[]"
+    @Published var stats = V2Stats()
 
     private var sink: GoMediaSink?
+    // Keeps the bound sinks alive alongside their Go-side references.
+    private var statsSink: GoStatsSink?
     // Keeps the bound StoreSource object alive alongside the Go-side ref.
     private var trustStore: KeychainTrust?
 
@@ -216,6 +252,13 @@ final class V2Controller: ObservableObject {
                 self?.handleState(json)
             }
         })
+        let sinkStats = GoStatsSink { [weak self] json in
+            Task { @MainActor in
+                self?.handleStats(json)
+            }
+        }
+        statsSink = sinkStats
+        RemoteAUSetStatsSink(sinkStats)
         pairedPeers = RemoteAUPeerList()
     }
 
@@ -264,6 +307,22 @@ final class V2Controller: ObservableObject {
         RemoteAUStop()
     }
 
+    /// Windows capture source: kind 0 = system audio, 1 = render device by
+    /// name, 2 = diagnostic test tone, 3 = per-app ("p:1,2" / "x:9").
+    /// (Go `int` bridges to Swift `Int32`, matching the other RemoteAU caps.)
+    func setSource(kind: Int, name: String) {
+        if let err = RemoteAUSetSource(Int32(kind), name) {
+            lastError = err.localizedDescription
+        }
+    }
+
+    /// Quality mode: 0 auto, 1 lowest, 2 lossless, 3 robust, 4 advanced.
+    func setQualityMode(_ mode: Int) {
+        if let err = RemoteAUSetQualityMode(Int32(mode)) {
+            lastError = err.localizedDescription
+        }
+    }
+
     func forgetPeer(idHex: String) {
         _ = RemoteAUForgetPeer(idHex)
         pairedPeers = RemoteAUPeerList()
@@ -297,6 +356,41 @@ final class V2Controller: ObservableObject {
             state = p.state ?? state
             lastError = p.error ?? ""
         }
+    }
+
+    private func handleStats(_ json: String) {
+        struct Wire: Decodable {
+            var state: String?
+            var connected: Bool?
+            var rtt_ms: Double?
+            var loss_pct: Double?
+            var late_pct: Double?
+            var jitter_ms: Double?
+            var buffer_ms: Double?
+            var packets_seen: Double?
+            var loss_packets: Double?
+            var late_packets: Double?
+            var reordered_packets: Double?
+            var concealed_frames: Double?
+            var max_burst: Double?
+        }
+        guard let data = json.data(using: .utf8),
+              let w = try? JSONDecoder().decode(Wire.self, from: data) else { return }
+        var s = V2Stats()
+        s.state = w.state ?? stats.state
+        s.connected = w.connected ?? false
+        s.rttMs = w.rtt_ms ?? 0
+        s.lossPct = w.loss_pct ?? 0
+        s.latePct = w.late_pct ?? 0
+        s.jitterMs = w.jitter_ms ?? 0
+        s.bufferMs = w.buffer_ms ?? 0
+        s.packetsSeen = w.packets_seen ?? 0
+        s.lossPackets = w.loss_packets ?? 0
+        s.latePackets = w.late_packets ?? 0
+        s.reorderedPackets = w.reordered_packets ?? 0
+        s.concealedFrames = w.concealed_frames ?? 0
+        s.maxBurst = w.max_burst ?? 0
+        stats = s
     }
 }
 
@@ -341,6 +435,26 @@ final class V2MediaRouter {
 
 #else
 
+/// Stub mirror of the framework's RemoteAUStatsSink (whose gomobile-imported
+/// string parameter is optional) so the placeholder controller below can
+/// follow the same wiring as the real branch.
+protocol StatsSink: AnyObject {
+    func onStats(_ json: String?)
+}
+
+final class GoStatsSink: NSObject, StatsSink {
+    let onStats: (String) -> Void
+
+    init(onStats: @escaping (String) -> Void) {
+        self.onStats = onStats
+    }
+
+    func onStats(_ json: String?) {
+        guard let json else { return }
+        onStats(json)
+    }
+}
+
 /// Placeholder when the Go framework is not linked (v1-only build).
 /// NOTE: release builds always link RemoteAU.xcframework (v2 + Opus), so this
 /// branch exists only to keep source-level consistency; it mirrors the real
@@ -350,6 +464,9 @@ final class V2Controller: ObservableObject {
     @Published var state = "unavailable"
     @Published var lastError = ""
     @Published var pairedPeers = "[]"
+    @Published var stats = V2Stats()
+
+    private var statsSink: GoStatsSink?
 
     struct AdvancedSettings {
         var codecOpus: Bool = false
@@ -366,12 +483,16 @@ final class V2Controller: ObservableObject {
 
     var peers: [PairedPC] { [] }
 
-    func setup() {}
+    func setup() {
+        statsSink = GoStatsSink { _ in }
+    }
     func connect(host: String, name: String, advanced: AdvancedSettings? = nil,
                  pinPrompt: @escaping () async -> String) {
         lastError = "v2 engine framework is not linked into this build"
     }
     func stop() {}
+    func setSource(kind: Int, name: String) {}
+    func setQualityMode(_ mode: Int) {}
     func forgetPeer(idHex: String) {}
 }
 

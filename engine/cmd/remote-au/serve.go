@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -40,11 +41,17 @@ func runServe(args []string, stdout, stderr io.Writer, backend audio.Backend, fo
 	recordDir := ""
 	profileName := ""
 	relayAddr := ""
+	dataDir := ""
 	toneModeName := "sine"
 	fs.StringVar(&recordDir, "record", recordDir, "record captured audio to WAV files in this directory")
 	fs.StringVar(&profileName, "profile", profileName, "apply a named profile (see profiles)")
 	fs.StringVar(&relayAddr, "relay", relayAddr, "register with this relay for WAN access")
+	fs.StringVar(&dataDir, "data-dir", dataDir, "trust-store directory (default: appdata; use separate dirs to run multiple identities)")
 	fs.StringVar(&toneModeName, "tone-mode", toneModeName, "test-tone pattern: sine or click (with --source testtone)")
+	appPIDs := ""
+	excludePIDs := ""
+	fs.StringVar(&appPIDs, "app-pid", appPIDs, "capture ONLY these process IDs (comma-separated), WASAPI process loopback")
+	fs.StringVar(&excludePIDs, "exclude-pid", excludePIDs, "capture everything EXCEPT these process IDs (single PID)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -66,7 +73,7 @@ func runServe(args []string, stdout, stderr io.Writer, backend audio.Backend, fo
 		}
 	}
 
-	store, err := pairing.NewWindowsStore()
+	store, err := openTrustStore(dataDir)
 	if err != nil {
 		return fmt.Errorf("open trust store: %w", err)
 	}
@@ -116,6 +123,8 @@ func runServe(args []string, stdout, stderr io.Writer, backend audio.Backend, fo
 		RecordDir:      recordDir,
 		RelayAddr:      relayAddr,
 		ToneMode:       toneMode,
+		CaptureApps:    parsePIDList(appPIDs),
+		ExcludeApps:    parsePIDList(excludePIDs),
 		Logger:         logger,
 	})
 	if err != nil {
@@ -138,9 +147,11 @@ func runRecv2(args []string, stdout, stderr io.Writer, backend audio.Backend, fo
 	hostAddr := ""
 	name := defaultHostname()
 	playbackSelector := ""
+	dataDir := ""
 	fs.StringVar(&hostAddr, "to", hostAddr, "host address, e.g. 192.168.1.10:47010")
 	fs.StringVar(&name, "name", name, "client name shown to the host")
 	fs.StringVar(&playbackSelector, "device", playbackSelector, "playback device selector (see devices)")
+	fs.StringVar(&dataDir, "data-dir", dataDir, "trust-store directory (default: appdata; use separate dirs to run multiple identities)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -151,7 +162,7 @@ func runRecv2(args []string, stdout, stderr io.Writer, backend audio.Backend, fo
 		return fmt.Errorf("recv2 requires --to <host:port>")
 	}
 
-	store, err := pairing.NewWindowsStore()
+	store, err := openTrustStore(dataDir)
 	if err != nil {
 		return fmt.Errorf("open trust store: %w", err)
 	}
@@ -269,3 +280,32 @@ func runRelay(args []string, stdout, stderr io.Writer, backend audio.Backend, fo
 
 var _ = transport.TransportUDP
 var _ = time.Second
+
+// parsePIDList parses a comma-separated PID list ("123, 456") into []uint32.
+func parsePIDList(s string) []uint32 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	var out []uint32
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		n, err := strconv.ParseUint(part, 10, 32)
+		if err != nil || n == 0 {
+			continue
+		}
+		out = append(out, uint32(n))
+	}
+	return out
+}
+
+// openTrustStore opens the trust store in dataDir, or the default app-data location.
+func openTrustStore(dataDir string) (pairing.Store, error) {
+	if dataDir != "" {
+		return pairing.NewWindowsStoreAt(dataDir)
+	}
+	return pairing.NewWindowsStore()
+}

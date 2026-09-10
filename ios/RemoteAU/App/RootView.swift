@@ -21,15 +21,26 @@ struct RootView: View {
     @AppStorage("v2DTX") private var v2DTX: Bool = false
     @AppStorage("manualV2Host") private var manualV2Host: String = ""
     @AppStorage("manualV2Port") private var manualV2Port: String = "47010"
+    // Windows capture source (v2), jitter bounds, named profile.
+    @AppStorage("v2SourceKind") private var v2SourceKind: Int = 0
+    @AppStorage("v2SourceName") private var v2SourceName: String = ""
+    @AppStorage("jitterMinMs") private var jitterMinMs: Double = 8
+    @AppStorage("jitterMaxMs") private var jitterMaxMs: Double = 120
+    @AppStorage("profile") private var storedProfile: String = ""
+    @AppStorage("remoteMode") private var remoteMode: Bool = false
     @State private var manualError: String? = nil
+    @State private var lastRecordingPath: String = ""
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: Theme.spacingL) {
                     connectionHero
+                    profileSection
                     if isLive {
                         qualitySection
+                    }
+                    if isLive || v2.stats.connected {
                         liveStatsSummary
                     }
                     discoveredSection
@@ -79,18 +90,33 @@ struct RootView: View {
                 v2.setup()
                 if !model.listening { model.start() }
                 model.startFinder()
-                if model.qualityPreset.rawValue != storedPreset {
-                    model.qualityPreset = QualityPreset(rawValue: storedPreset) ?? .auto
-                }
-                if model.manualTargetMs != storedTargetMs {
-                    model.manualTargetMs = storedTargetMs
-                    model.setManualTarget(ms: storedTargetMs)
+                // Re-apply the persisted profile, or the individual settings
+                // when no profile has been chosen yet.
+                if let profile = Profile(rawValue: storedProfile) {
+                    applyProfile(profile)
+                } else {
+                    if model.qualityPreset.rawValue != storedPreset {
+                        let preset = QualityPreset(rawValue: storedPreset) ?? .auto
+                        model.qualityPreset = preset
+                        model.setPreset(preset)
+                    }
+                    if model.manualTargetMs != storedTargetMs {
+                        model.manualTargetMs = storedTargetMs
+                        model.setManualTarget(ms: storedTargetMs)
+                    }
                 }
                 if model.manualIPFilter != storedIPFilter {
                     model.manualIPFilter = storedIPFilter
                 }
+                model.setJitterBounds(minMs: jitterMinMs, maxMs: jitterMaxMs)
                 V2MediaRouter.shared.handler = { pcm in
                     model.feedExternalPCM(pcm)
+                }
+            }
+            .onChange(of: v2.state) { newState in
+                // Sync the host quality mode once the secure session is live.
+                if newState == "streaming" {
+                    v2.setQualityMode(model.qualityPreset.v2Mode)
                 }
             }
             .onChange(of: scenePhase) { phase in
@@ -223,16 +249,86 @@ struct RootView: View {
     }
 
     private var latencyPill: some View {
-        StatPill(icon: "timer",
-                 title: "Latency",
-                 value: String(format: "%.0f ms", model.stats.softwareLatencyMs))
+        if v2.stats.connected {
+            return StatPill(icon: "timer",
+                            title: "RTT",
+                            value: String(format: "%.0f ms", v2.stats.rttMs))
+        }
+        return StatPill(icon: "timer",
+                        title: "Latency",
+                        value: String(format: "%.0f ms", model.stats.softwareLatencyMs))
     }
 
     private var qualityPill: some View {
-        StatPill(icon: "wifi",
-                 title: "Network",
-                 value: Theme.qualityLabel(for: model.stats.lossPercent,
-                                           jitter: model.stats.jitterMs))
+        let loss = v2.stats.connected ? v2.stats.lossPct : model.stats.lossPercent
+        let jitter = v2.stats.connected ? v2.stats.jitterMs : model.stats.jitterMs
+        return StatPill(icon: "wifi",
+                        title: "Network",
+                        value: Theme.qualityLabel(for: loss, jitter: jitter))
+    }
+
+    // MARK: Named profiles
+
+    private var profileSection: some View {
+        VStack(alignment: .leading, spacing: Theme.spacingS) {
+            Text("Profile")
+                .font(.headline)
+            Picker("Profile", selection: profileBinding) {
+                ForEach(Profile.allCases) { profile in
+                    Text(profile.rawValue).tag(profile)
+                }
+            }
+            .pickerStyle(.menu)
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Text(selectedProfile.detail)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+
+            if remoteMode {
+                Text("Remote / Efficient tunes codec and buffering for relay-friendly streaming; relay connection setup is not available in this build.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(Theme.spacingL)
+        .background(.background.secondary, in: RoundedRectangle(cornerRadius: Theme.cornerL))
+    }
+
+    private var selectedProfile: Profile {
+        Profile(rawValue: storedProfile) ?? .homeLossless
+    }
+
+    private var profileBinding: Binding<Profile> {
+        Binding(
+            get: { selectedProfile },
+            set: { applyProfile($0) }
+        )
+    }
+
+    /// Applies every knob a named profile controls: quality preset, v2 codec
+    /// preferences, jitter target and the remote-mode hint.
+    private func applyProfile(_ profile: Profile) {
+        storedProfile = profile.rawValue
+
+        model.qualityPreset = profile.qualityPreset
+        model.setPreset(profile.qualityPreset)
+        storedPreset = profile.qualityPreset.rawValue
+
+        v2CodecOpus = profile.preferOpus
+        v2FEC = profile.useFEC
+        v2DTX = profile.useDTX
+        v2BitrateKbps = profile.bitrateKbps
+
+        model.manualTargetMs = profile.jitterTargetMs
+        storedTargetMs = profile.jitterTargetMs
+        model.setManualTarget(ms: profile.jitterTargetMs)
+
+        remoteMode = profile.remoteMode
+
+        if v2Streaming {
+            v2.setQualityMode(profile.qualityPreset.v2Mode)
+        }
     }
 
     // MARK: Quality presets
@@ -250,6 +346,9 @@ struct RootView: View {
             .onChange(of: model.qualityPreset) { newValue in
                 model.setPreset(newValue)
                 storedPreset = newValue.rawValue
+                if v2Streaming {
+                    v2.setQualityMode(newValue.v2Mode)
+                }
             }
 
             if model.qualityPreset == .auto {
@@ -308,10 +407,140 @@ struct RootView: View {
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
+
+                captureSourceControls
+                jitterBoundsControls
+                recordingControls
             }
         }
         .padding(Theme.spacingL)
         .background(.background.secondary, in: RoundedRectangle(cornerRadius: Theme.cornerL))
+    }
+
+    // MARK: Capture source (Windows, v2)
+
+    private var captureSourceControls: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Capture source (Windows, v2)")
+                .font(.footnote.weight(.semibold))
+            Picker("Capture source", selection: $v2SourceKind) {
+                Text("System audio (default)").tag(0)
+                Text("Test tone (diagnostics)").tag(2)
+                Text("Custom device…").tag(1)
+                Text("Per-app…").tag(3)
+            }
+            .pickerStyle(.menu)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .disabled(!v2Active)
+
+            if v2SourceKind == 1 {
+                TextField("Render device name", text: $v2SourceName)
+                    .textFieldStyle(.roundedBorder)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                    .disabled(!v2Active)
+            } else if v2SourceKind == 3 {
+                TextField("PIDs, e.g. p:1234 or x:5678", text: $v2SourceName)
+                    .textFieldStyle(.roundedBorder)
+                    .keyboardType(.numbersAndPunctuation)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                    .disabled(!v2Active)
+            }
+
+            Button {
+                applySource()
+            } label: {
+                Text("Apply capture source")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .disabled(!v2Active)
+
+            Text(v2Active
+                 ? "The PC validates the source and rejects invalid devices or PIDs."
+                 : "Connect to a PC first.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func applySource() {
+        let name: String
+        switch v2SourceKind {
+        case 1, 3:
+            name = v2SourceName.trimmingCharacters(in: .whitespaces)
+        default:
+            name = ""
+        }
+        v2.setSource(kind: v2SourceKind, name: name)
+    }
+
+    // MARK: Advanced jitter bounds
+
+    private var jitterBoundsControls: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Jitter bounds")
+                .font(.footnote.weight(.semibold))
+            HStack {
+                Slider(value: $jitterMinMs, in: 4...120, step: 1) {
+                    Text("Minimum")
+                }
+                Text("\(Int(jitterMinMs)) ms")
+                    .monospacedDigit()
+                    .frame(width: 64, alignment: .trailing)
+            }
+            .onChange(of: jitterMinMs) { _ in
+                model.setJitterBounds(minMs: jitterMinMs, maxMs: jitterMaxMs)
+            }
+            HStack {
+                Slider(value: $jitterMaxMs, in: 20...400, step: 1) {
+                    Text("Maximum")
+                }
+                Text("\(Int(jitterMaxMs)) ms")
+                    .monospacedDigit()
+                    .frame(width: 64, alignment: .trailing)
+            }
+            .onChange(of: jitterMaxMs) { _ in
+                model.setJitterBounds(minMs: jitterMinMs, maxMs: jitterMaxMs)
+            }
+            Text("Auto never buffers below Min or above Max; fixed presets and the manual target stay in range too.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: Session recording
+
+    private var recordingControls: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Session recording")
+                .font(.footnote.weight(.semibold))
+            Toggle("Record session", isOn: recordingBinding)
+            if lastRecordingPath.isEmpty {
+                Text("Saves the received audio as a 16-bit WAV in Documents/Recordings.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Last saved: \(lastRecordingPath)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+            }
+        }
+    }
+
+    private var recordingBinding: Binding<Bool> {
+        Binding(
+            get: { model.recording },
+            set: { on in
+                guard on != model.recording else { return }
+                if let url = model.toggleRecording() {
+                    lastRecordingPath = url.path
+                }
+            }
+        )
     }
 
     // MARK: Discovered PCs
@@ -493,6 +722,10 @@ struct RootView: View {
 
     private var liveStatsSummary: some View {
         DisclosureGroup {
+            if v2.stats.connected {
+                V2StatsView(stats: v2.stats)
+                Divider()
+            }
             StatsView(stats: model.stats)
         } label: {
             HStack {
@@ -802,5 +1035,82 @@ struct DeviceCard: View {
 extension StatsSnapshot {
     var presetDescription: String {
         "Auto adapts buffering to network health — small on clean Wi-Fi, larger when it degrades."
+    }
+}
+
+// MARK: - Named profiles
+
+/// One-tap configurations bundling a quality preset, v2 codec preferences and
+/// a jitter target. Selected profiles are persisted and re-applied at launch.
+enum Profile: String, CaseIterable, Identifiable {
+    case homeLossless = "Home / Lossless"
+    case gamingLowest = "Gaming / Lowest Latency"
+    case weakWiFi = "Weak Wi-Fi / Robust"
+    case remote = "Remote / Efficient"
+
+    var id: String { rawValue }
+
+    var qualityPreset: QualityPreset {
+        switch self {
+        case .homeLossless: return .lossless
+        case .gamingLowest: return .lowestLatency
+        case .weakWiFi, .remote: return .robust
+        }
+    }
+
+    /// Manual jitter target in ms (applied through the advanced/manual path).
+    var jitterTargetMs: Double {
+        switch self {
+        case .homeLossless: return 25
+        case .gamingLowest: return 10
+        case .weakWiFi: return 60
+        case .remote: return 90
+        }
+    }
+
+    var preferOpus: Bool {
+        switch self {
+        case .weakWiFi, .remote: return true
+        case .homeLossless, .gamingLowest: return false
+        }
+    }
+
+    var useFEC: Bool { preferOpus }
+    var useDTX: Bool { preferOpus }
+
+    var bitrateKbps: Int {
+        switch self {
+        case .remote: return 64
+        case .weakWiFi: return 96
+        case .homeLossless, .gamingLowest: return 128
+        }
+    }
+
+    var remoteMode: Bool { self == .remote }
+
+    var detail: String {
+        switch self {
+        case .homeLossless:
+            return "PCM with a slightly safer buffer for home Wi-Fi."
+        case .gamingLowest:
+            return "PCM with the smallest adaptive buffer for the lowest latency."
+        case .weakWiFi:
+            return "Opus + FEC + DTX at 96 kbps; tolerates poor Wi-Fi."
+        case .remote:
+            return "Opus + FEC + DTX at 64 kbps; relay-friendly and data-efficient."
+        }
+    }
+}
+
+extension QualityPreset {
+    /// Maps to the Go `RemoteAUSetQualityMode` argument.
+    var v2Mode: Int {
+        switch self {
+        case .auto: return 0
+        case .lowestLatency: return 1
+        case .lossless: return 2
+        case .robust: return 3
+        case .advanced: return 4
+        }
     }
 }

@@ -27,27 +27,37 @@ var version = "dev"
 
 // app carries tray-global state.
 type app struct {
-	mu           sync.Mutex
-	host         *engine.Host
-	cancel       context.CancelFunc
-	running      bool
-	store        pairing.Store
-	backend      audio.Backend
-	logger       logging.Logger
-	logFile      io.Closer
-	format       audio.Format
-	preset       presetID
-	muted        bool
-	lastReceiver string
-	autoStream   bool
-	toneMode     audio.ToneMode
-	sourceLabel  string
-	lastError    string
+	mu             sync.Mutex
+	host           *engine.Host
+	cancel         context.CancelFunc
+	running        bool
+	store          pairing.Store
+	backend        audio.Backend
+	logger         logging.Logger
+	logFile        io.Closer
+	format         audio.Format
+	preset         presetID
+	profile        profileID
+	profileHint    string
+	muted          bool
+	lastReceiver   string
+	autoStream     bool
+	autoReceiverID string
+	toneMode       audio.ToneMode
+	sourceLabel    string
+	captureApps    string
+	lastError      string
 
 	// Settings window (singleton) state.
 	settingsMu       sync.Mutex
 	settingsUI       *settingsUI
 	settingsStarting bool
+
+	// Pairing window (singleton) state.
+	pairingMu       sync.Mutex
+	pairingUI       *pairingUI
+	pairingStarting bool
+	pairingLive     bool
 
 	// Menu items we update at runtime.
 	mStatus       *systray.MenuItem
@@ -57,6 +67,7 @@ type app struct {
 	mReceivers    *systray.MenuItem
 	mAutoStart    *systray.MenuItem
 	qualityItems  map[presetID]*systray.MenuItem
+	profileItems  map[profileID]*systray.MenuItem
 	sourceItems   []*systray.MenuItem
 	receiverItems []*systray.MenuItem
 }
@@ -65,11 +76,15 @@ func main() {
 	a := &app{
 		format:       audio.DefaultFormat(),
 		qualityItems: make(map[presetID]*systray.MenuItem),
+		profileItems: make(map[profileID]*systray.MenuItem),
 	}
 	if s, ok := loadSettings(); ok {
 		a.autoStream = s.AutoStream
 		a.lastReceiver = s.LastReceiver
 		a.preset = presetFromName(s.Preset)
+		a.profile = profileFromName(s.Profile)
+		a.profileHint = profileHintFor(a.profile)
+		a.autoReceiverID = s.AutoReceiverID
 		a.muted = s.Muted
 	} else {
 		a.autoStream = true
@@ -196,17 +211,24 @@ func (a *app) onReady() {
 		presetLossless: itemLossless,
 		presetRobust:   itemRobust,
 	}
-	// Reflect the persisted preset selection.
-	for id, it := range a.qualityItems {
-		if id == a.preset {
-			it.Check()
-		} else {
-			it.Uncheck()
-		}
+
+	// Named profiles (preset + FEC policy + status hint).
+	profMenu := systray.AddMenuItem("Profiles", "Named quality profiles")
+	for _, spec := range profileSpecs {
+		spec := spec
+		it := profMenu.AddSubMenuItemCheckbox(spec.Name, profileTooltip(spec), false)
+		a.profileItems[spec.ID] = it
+		go func() {
+			for range it.ClickedCh {
+				a.applyProfileID(spec.ID)
+			}
+		}()
 	}
+	a.refreshMenuChecks()
 
 	a.mAutoStart = systray.AddMenuItemCheckbox("Start with Windows", "Launch RemoteAU at login", a.autostartEnabled())
 
+	mPairQR := systray.AddMenuItem("Show pairing QR", "Start pairing from the phone; the QR appears here")
 	mSettings := systray.AddMenuItem("Open Settings", "Source, receivers, quality and diagnostics")
 	diag := systray.AddMenuItem("Open log folder", "Show engine diagnostics log")
 	systray.AddSeparator()
@@ -226,6 +248,8 @@ func (a *app) onReady() {
 				a.toggleAutostart()
 			case <-mSettings.ClickedCh:
 				a.openSettings()
+			case <-mPairQR.ClickedCh:
+				a.showPairingInfo()
 			case <-diag.ClickedCh:
 				openLogFolder()
 			case <-mExit.ClickedCh:
@@ -281,13 +305,14 @@ func (a *app) startStreaming() {
 		ToneMode:      toneMode,
 		Format:        a.format,
 		OnPairingInfo: func(code, url string) {
-			messageBox("RemoteAU - Pairing",
-				fmt.Sprintf("Pair your iPhone:\n\nCode:  %s\n\nOr scan this URL in the app (QR):\n%s", code, url))
+			a.showPairing(code, url)
 		},
 		OnReceiversChanged: func(receivers []engine.ReceiverInfo) {
 			if len(receivers) == 0 {
 				return
 			}
+			// A receiver connected: the live pairing window (if any) is done.
+			a.closePairingIfLive()
 			name := receivers[0].Name
 			a.mu.Lock()
 			changed := name != "" && name != a.lastReceiver
@@ -449,6 +474,79 @@ func (a *app) setSourceLabel(label string) {
 	a.mu.Unlock()
 }
 
+// setCaptureAppsLabel records the applied per-application capture selection.
+func (a *app) setCaptureAppsLabel(label string) {
+	a.mu.Lock()
+	a.captureApps = label
+	a.mu.Unlock()
+}
+
+// captureAppsLabel returns the applied per-application capture selection.
+func (a *app) captureAppsLabel() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.captureApps
+}
+
+// setAutoReceiver records the preferred auto-connect receiver (exclusive).
+func (a *app) setAutoReceiver(id string) {
+	a.mu.Lock()
+	a.autoReceiverID = id
+	a.mu.Unlock()
+	a.saveSettings()
+}
+
+// clearAutoReceiverIf clears the preference only when it currently points at id.
+func (a *app) clearAutoReceiverIf(id string) {
+	a.mu.Lock()
+	if a.autoReceiverID == id {
+		a.autoReceiverID = ""
+	}
+	a.mu.Unlock()
+	a.saveSettings()
+}
+
+// clearAutoReceiver clears the preferred auto-connect receiver.
+func (a *app) clearAutoReceiver() {
+	a.setAutoReceiver("")
+}
+
+// autoReceiver returns the preferred auto-connect receiver id.
+func (a *app) autoReceiver() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.autoReceiverID
+}
+
+// hint returns the persistent profile status hint ("" when none).
+func (a *app) hint() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.profileHint
+}
+
+// appendHint appends a profile hint to a status line when present.
+func appendHint(status, hint string) string {
+	if hint == "" {
+		return status
+	}
+	return status + " | " + hint
+}
+
+// autoConnectNote surfaces the selected auto-connect receiver when it is live.
+func (a *app) autoConnectNote(rs []engine.ReceiverInfo) string {
+	id := a.autoReceiver()
+	if id == "" {
+		return ""
+	}
+	for _, r := range rs {
+		if r.DeviceID == id {
+			return "auto-connect receiver: " + r.Name
+		}
+	}
+	return ""
+}
+
 // setReceiverMuted mutes one live receiver.
 func (a *app) setReceiverMuted(id string, muted bool) {
 	a.mu.Lock()
@@ -540,10 +638,14 @@ func (a *app) receiverRefresher() {
 		// Update status line.
 		if len(current) > 0 {
 			r := current[0]
-			a.setStatus(fmt.Sprintf("Streaming to %s (%s, %s, %s, %.1f/%.1f/%.1f ms)",
-				r.Name, r.Codec, r.State, r.QualityMode, r.LossPct, r.JitterMs, r.RTTMs), "Stop streaming")
+			status := fmt.Sprintf("Streaming to %s (%s, %s, %s, %.1f/%.1f/%.1f ms)",
+				r.Name, r.Codec, r.State, r.QualityMode, r.LossPct, r.JitterMs, r.RTTMs)
+			if note := a.autoConnectNote(current); note != "" {
+				status += " | " + note
+			}
+			a.setStatus(appendHint(status, a.hint()), "Stop streaming")
 		} else {
-			a.setStatus("Waiting for receivers…", "Stop streaming")
+			a.setStatus(appendHint("Waiting for receivers…", a.hint()), "Stop streaming")
 		}
 	}
 }
@@ -586,16 +688,12 @@ func (a *app) rebuildReceiverItems(receivers []engine.ReceiverInfo) {
 // MARK: quality + source
 
 func (a *app) applyPreset(item *systray.MenuItem) {
-	var selected presetID = presetAuto
 	for id, it := range a.qualityItems {
 		if it == item {
-			selected = id
-		} else {
-			it.Uncheck()
+			a.applyPresetID(id)
+			return
 		}
 	}
-	item.Check()
-	a.applyPresetID(selected)
 }
 
 func (a *app) selectSource(index int, useDefault bool, item *systray.MenuItem) {
@@ -612,6 +710,7 @@ func (a *app) selectSource(index int, useDefault bool, item *systray.MenuItem) {
 	if useDefault {
 		_ = host.SetSourceDevice("")
 		a.setSourceLabel("System audio (default)")
+		a.setCaptureAppsLabel("")
 		return
 	}
 	lists, err := a.backend.EnumerateDevices()
@@ -621,6 +720,7 @@ func (a *app) selectSource(index int, useDefault bool, item *systray.MenuItem) {
 	name := lists.Playback[index].Name
 	_ = host.SetSourceDevice(name)
 	a.setSourceLabel("Output: " + name)
+	a.setCaptureAppsLabel("")
 }
 
 // MARK: autostart

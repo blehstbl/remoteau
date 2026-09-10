@@ -34,6 +34,12 @@ func NewWindowsStore() (*WindowsStore, error) {
 	return newWindowsStoreAt(filepath.Join(appdata, "RemoteAU"))
 }
 
+// NewWindowsStoreAt opens a store rooted at dir. Useful for tests and for
+// running multiple identities on one machine (each with its own data dir).
+func NewWindowsStoreAt(dir string) (*WindowsStore, error) {
+	return newWindowsStoreAt(dir)
+}
+
 // newWindowsStoreAt opens a store rooted at dir (used by tests).
 func newWindowsStoreAt(dir string) (*WindowsStore, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {

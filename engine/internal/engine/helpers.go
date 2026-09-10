@@ -1,14 +1,13 @@
 package engine
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
-
 	"remote-au/internal/transport/v2"
 )
 
-// PeerCertFingerprint returns the SHA-256 fingerprint (hex) of the remote
-// peer's TLS certificate, or "" when unavailable.
+// PeerCertFingerprint returns the stable public-key fingerprint (hex) of the
+// remote peer's TLS certificate, or "" when unavailable. It uses the public
+// key (not the certificate DER) so it survives certificate regeneration
+// across restarts, which device pinning requires.
 func PeerCertFingerprint(conn *transportv2.Conn) string {
 	if conn == nil {
 		return ""
@@ -17,6 +16,5 @@ func PeerCertFingerprint(conn *transportv2.Conn) string {
 	if len(state.TLS.PeerCertificates) == 0 {
 		return ""
 	}
-	sum := sha256.Sum256(state.TLS.PeerCertificates[0].Raw)
-	return hex.EncodeToString(sum[:])
+	return transportv2.PublicKeyFingerprint(state.TLS.PeerCertificates[0])
 }

@@ -63,12 +63,24 @@ final class ReceiverModel: ObservableObject {
     @Published var stats = StatsSnapshot()
     @Published var discoveredPeers: [DiscoveredPeer] = []
     @Published var finderOn = false
+    @Published var recording = false
 
     // MARK: Engine pieces
     private let ring = PCMRing(capacityBytes: 48_000 * 4 * 2, bytesPerFrame: 4) // ~500 ms @48k stereo
     private let audio: AudioEngineController
     private let reorder: Locked<ReorderBuffer?>
     private let policy: Locked<AdaptiveJitterPolicy>
+
+    // MARK: Session recording
+    private let recorder = SessionRecorder()
+    /// Fast, lock-guarded mirror of `recording` so the network/Go threads can
+    /// decide whether to hand PCM to the recorder without touching main
+    /// state. The recorder itself drops appends while inactive.
+    private let recordingActive = Locked(false)
+    /// Format of the current stream, updated on the main queue by
+    /// configureStream(). v2 (no v1 handshake) keeps the 48 kHz/stereo default.
+    private var recordSampleRate = 48000
+    private var recordChannels = 2
 
     // Network threads
     private var audioThread: Thread?
@@ -119,7 +131,7 @@ final class ReceiverModel: ObservableObject {
         }
 
         let sink: (UnsafeRawPointer, Int) -> Void = { [weak self] ptr, count in
-            self?.ring.write(ptr, count: count)
+            self?.handleV1PCM(ptr, count: count)
         }
         reorder.withLock {
             $0?.sink = sink
@@ -257,6 +269,9 @@ final class ReceiverModel: ObservableObject {
     /// Feeds externally produced PCM (the Go v2 engine, when linked) into the
     /// same ring/render pipeline. Non-blocking; called from Go callbacks.
     func feedExternalPCM(_ bytes: [UInt8]) {
+        if recordingActive.value, !bytes.isEmpty {
+            recorder.append(bytes)
+        }
         bytes.withUnsafeBufferPointer { buf in
             if let base = buf.baseAddress {
                 ring.write(base, count: bytes.count)
@@ -264,12 +279,56 @@ final class ReceiverModel: ObservableObject {
         }
     }
 
+    /// v1 path: the reorder buffer hands us ordered/concealed S16LE PCM from
+    /// the network thread. Record the original bytes before the ring may drop
+    /// the oldest frames under overflow, then write into the ring.
+    private func handleV1PCM(_ ptr: UnsafeRawPointer, count: Int) {
+        if count > 0, recordingActive.value {
+            recorder.append([UInt8](UnsafeRawBufferPointer(start: ptr, count: count)))
+        }
+        ring.write(ptr, count: count)
+    }
+
+    // MARK: Session recording
+
+    /// Starts or stops a WAV recording of the current stream. Returns the
+    /// saved file URL when a recording was stopped, nil otherwise.
+    @discardableResult
+    func toggleRecording() -> URL? {
+        if recording {
+            recordingActive.withLock { $0 = false }
+            let url = recorder.stop()
+            recording = false
+            return url
+        }
+        do {
+            try recorder.start(sampleRate: recordSampleRate, channels: recordChannels)
+            recordingActive.withLock { $0 = true }
+            recording = true
+        } catch {
+            postError("Recording: \(error.localizedDescription)")
+        }
+        return nil
+    }
+
     func setPreset(_ preset: QualityPreset) {
-        policy.withLock { $0 = AdaptiveJitterPolicy(preset: preset, sampleRate: 48000) }
+        policy.withLock { p in
+            // Bounds are user configuration, not part of the preset; carry
+            // them across the rebuild.
+            let lo = p.minMs
+            let hi = p.maxMs
+            p = AdaptiveJitterPolicy(preset: preset, sampleRate: 48000)
+            p.setBounds(minMs: lo, maxMs: hi)
+        }
     }
 
     func setManualTarget(ms: Double) {
         policy.withLock { $0.setManualTarget(ms: ms) }
+    }
+
+    /// Advanced jitter bounds; forwarded to the adaptive policy.
+    func setJitterBounds(minMs: Double, maxMs: Double) {
+        policy.withLock { $0.setBounds(minMs: minMs, maxMs: maxMs) }
     }
 
     private func syncIPFilter() {
@@ -466,7 +525,7 @@ final class ReceiverModel: ObservableObject {
             let rb = ReorderBuffer(bytesPerFrame: bytesPerFrame, frameDurationMs: frameMs)
             rb.sampleRate = Double(hs.sampleRate)
             rb.sink = { [weak self] ptr, count in
-                self?.ring.write(ptr, count: count)
+                self?.handleV1PCM(ptr, count: count)
             }
             ring.setBytesPerFrame(bytesPerFrame)
             reorder.withLock { $0 = rb }
@@ -492,6 +551,8 @@ final class ReceiverModel: ObservableObject {
                 self.ring.reset()
                 self.reorder.withLock { $0?.reset() }
             }
+            self.recordSampleRate = Int(hs.sampleRate)
+            self.recordChannels = max(1, Int(hs.channels))
             self.state = .streaming(name: name)
         }
 

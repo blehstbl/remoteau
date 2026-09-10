@@ -4,10 +4,13 @@ package wasapi
 
 import (
 	"fmt"
+	"runtime"
 	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+
+	"remote-au/internal/audio"
 )
 
 // Audio session enumeration for per-app capture pickers (Phase 9).
@@ -26,6 +29,9 @@ var (
 	iidIAudioSessionManager2   = newGUID("{77AAFC35-F1CB-4D17-9CD9-3EB8E0BD6533}")
 	iidIAudioSessionEnumerator = newGUID("{E2F5BB66-D3CA-4E9C-A5C7-A0B0E4B7C2E8}")
 	iidIAudioSessionControl2   = newGUID("{BFB7FF88-7239-4FC9-8FA2-07C950BE9C6D}")
+
+	procQueryFullProcessImageNameW = windows.NewLazySystemDLL("kernel32.dll").
+					NewProc("QueryFullProcessImageNameW")
 )
 
 // AudioSessionState values (audiopolicy.h).
@@ -93,6 +99,27 @@ func ListAudioProcesses() ([]ProcessInfo, error) {
 		if ok && info.State == sessionStateActive {
 			out = append(out, info)
 		}
+	}
+	return out, nil
+}
+
+// ListAudioProcesses implements audio.ProcessLister so UIs can discover the
+// capability by type-asserting a Backend. It delegates to the package-level
+// enumeration, which performs its own COM initialization on the calling
+// thread, and converts to the platform-neutral type. The OS thread is pinned
+// so the CoInitializeEx and the COM calls that follow run in the same COM
+// apartment.
+func (b *Backend) ListAudioProcesses() ([]audio.AudioProcessInfo, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	infos, err := ListAudioProcesses()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]audio.AudioProcessInfo, 0, len(infos))
+	for _, in := range infos {
+		out = append(out, audio.AudioProcessInfo{PID: in.PID, Name: in.DisplayName, State: in.State})
 	}
 	return out, nil
 }

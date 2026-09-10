@@ -41,12 +41,27 @@ import (
 //     requesting more than one is rejected (API limitation, documented).
 
 var (
-	combase                         = windows.NewLazySystemDLL("combase.dll")
-	procActivateAudioInterfaceAsync = combase.NewProc("ActivateAudioInterfaceAsync")
-	kernel32                        = windows.NewLazySystemDLL("kernel32.dll")
-	procOpenProcess                 = kernel32.NewProc("OpenProcess")
-	procQueryFullProcessImageNameW  = kernel32.NewProc("QueryFullProcessImageNameW")
+	mmdevapi                  = windows.NewLazySystemDLL("mmdevapi.dll")
+	procActivateAudioMMDevAPI = mmdevapi.NewProc("ActivateAudioInterfaceAsync")
+	combase                   = windows.NewLazySystemDLL("combase.dll")
+	procActivateAudioCombase  = combase.NewProc("ActivateAudioInterfaceAsync")
+	kernel32                  = windows.NewLazySystemDLL("kernel32.dll")
+	procOpenProcess           = kernel32.NewProc("OpenProcess")
 )
+
+// findActivateAudioInterfaceAsync locates the process-loopback activation
+// entry point. Microsoft's documentation attributes it to mmdevapi.dll, but
+// some builds forward it from combase.dll — probe both.
+func findActivateAudioInterfaceAsync() (*windows.LazyProc, error) {
+	if err := procActivateAudioMMDevAPI.Find(); err == nil {
+		return procActivateAudioMMDevAPI, nil
+	}
+	if err := procActivateAudioCombase.Find(); err == nil {
+		return procActivateAudioCombase, nil
+	}
+	return nil, fmt.Errorf("ActivateAudioInterfaceAsync not found in mmdevapi.dll or combase.dll " +
+		"(process loopback requires Windows 10 2004+, build 19041+)")
+}
 
 // GUIDs (Windows SDK). iidIAudioClient lives in com.go.
 var (
@@ -56,7 +71,8 @@ var (
 
 // Process-loopback constants (audioclient.h / combase activation API).
 const (
-	vtUI8 = 21 // VT_UI8 PROPVARIANT tag
+	vtUI8  = 21 // VT_UI8 PROPVARIANT tag
+	vtBlob = 65 // VT_BLOB PROPVARIANT tag
 
 	// AUDIOCLIENT_ACTIVATION_TYPE: 0 is INVALID, 1 is PROCESS_LOOPBACK.
 	audioClientActivationTypeProcessLoopback = 1
@@ -183,21 +199,28 @@ func activateRelease(this uintptr) uintptr {
 	return uintptr(atomic.AddInt32(&h.refs, -1))
 }
 
-// activateCompleted runs on a COM/RPC thread when activation finishes. It
-// pulls the IAudioClient out via IActivateAudioInterfaceOperation::GetResult
-// (vtable slot 3) and wakes the waiting goroutine. Must stay short and must
-// not take locks the waiter holds (it doesn't take any).
+// activateCompleted runs on a COM/RPC thread when activation finishes. The
+// object is IActivateAudioInterfaceAsyncOperation, whose method is
+// GetActivateResult(HRESULT*, IUnknown**) (vtable slot 3) — NOT
+// IAsyncOperation::GetResult. We read the activation HRESULT, then
+// QueryInterface for IAudioClient. Must stay short and take no locks.
 func activateCompleted(this, op uintptr) uintptr {
 	h := (*activateCompletionHandler)(cbPtr(this))
-	hr := eFail
-	var out unsafe.Pointer
+	hrActivate := uint32(eFail)
+	var client unsafe.Pointer
 	if op != 0 {
-		hr = callCom(vtable(cbPtr(op))[3], cbPtr(op),
-			uintptr(unsafe.Pointer(iidIAudioClient)), uintptr(unsafe.Pointer(&out)))
+		var unk unsafe.Pointer
+		ret := callCom(vtable(cbPtr(op))[3], cbPtr(op),
+			uintptr(unsafe.Pointer(&hrActivate)), uintptr(unsafe.Pointer(&unk)))
+		if ret == 0 && hrActivate == 0 && unk != nil {
+			hrActivate = uint32(callCom(vtable(unk)[0], unk,
+				uintptr(unsafe.Pointer(iidIAudioClient)), uintptr(unsafe.Pointer(&client))))
+			callCom(vtable(unk)[2], unk) // release the IUnknown
+		}
 	}
 	h.once.Do(func() {
-		h.hr = hr
-		h.result = out
+		h.hr = uintptr(hrActivate)
+		h.result = client
 		close(h.done)
 	})
 	return 0 // S_OK
@@ -207,33 +230,35 @@ func activateCompleted(this, op uintptr) uintptr {
 // for a single PID. Returns the IAudioClient pointer; the caller owns the
 // reference (and releases it via audioClient.release()).
 func activateProcessLoopbackClient(pid uint32, mode uint32) (unsafe.Pointer, error) {
-	if err := procActivateAudioInterfaceAsync.Find(); err != nil {
-		return nil, fmt.Errorf("process loopback requires Windows 10 2004+ "+
-			"(combase!ActivateAudioInterfaceAsync missing): %w", err)
+	procActivate, err := findActivateAudioInterfaceAsync()
+	if err != nil {
+		return nil, err
 	}
 
 	// AUDIOCLIENT_ACTIVATION_PARAMS (audioclient.h): ActivationType (u32
-	// enum) at offset 0, then the ProcessLoopbackParams union
-	// {TargetProcessId u32; ProcessLoopbackMode u32} at offset 4 (union
-	// alignment is 4 — both members are DWORDs); 12 bytes, padded to 16.
-	var params [16]byte
+	// enum) at offset 0, then AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS
+	// {TargetProcessId u32; ProcessLoopbackMode u32} at offsets 4 and 8.
+	// sizeof == 12 (no padding for DWORD members).
+	var params [12]byte
 	binary.LittleEndian.PutUint32(params[0:], audioClientActivationTypeProcessLoopback)
 	binary.LittleEndian.PutUint32(params[4:], pid)
 	binary.LittleEndian.PutUint32(params[8:], mode)
 
-	// PROPVARIANT carrying the params pointer (VT_UI8): vt u16 at offset 0,
-	// 6 bytes padding, the 8-byte union value at offset 8 (x64) — the same
-	// layout mmdevice.go reads for friendlyName, constructed here.
+	// PROPVARIANT carrying the params (VT_BLOB, as in Microsoft's
+	// ApplicationLoopback sample): vt u16 at offset 0, then the BLOB union at
+	// offset 8 { ULONG cbSize; BYTE *pBlobData; } with the pointer at 16.
 	var pv [24]byte
-	binary.LittleEndian.PutUint16(pv[0:], vtUI8)
-	binary.LittleEndian.PutUint64(pv[8:], uint64(uintptr(unsafe.Pointer(&params[0]))))
+	binary.LittleEndian.PutUint16(pv[0:], vtBlob)
+	binary.LittleEndian.PutUint32(pv[8:], uint32(len(params)))
+	binary.LittleEndian.PutUint64(pv[16:], uint64(uintptr(unsafe.Pointer(&params[0]))))
 
-	// deviceName: L"" (process loopback needs no endpoint).
+	// deviceName: empty string for process loopback (NULL is rejected with
+	// E_INVALIDARG; Microsoft's ApplicationLoopback sample passes L"").
 	var emptyDeviceName [1]uint16
 
 	h := newActivateCompletionHandler()
 	var op unsafe.Pointer
-	hr, _, _ := procActivateAudioInterfaceAsync.Call(
+	hr, _, _ := procActivate.Call(
 		uintptr(unsafe.Pointer(&emptyDeviceName[0])),
 		uintptr(unsafe.Pointer(iidIAudioClient)),
 		uintptr(unsafe.Pointer(&pv[0])),
@@ -257,6 +282,11 @@ func activateProcessLoopbackClient(pid uint32, mode uint32) (unsafe.Pointer, err
 		return nil, fmt.Errorf("process loopback activation timed out (pid %d)", pid)
 	}
 	if h.hr != 0 {
+		if uint32(h.hr) == 0x80070002 { // HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)
+			return nil, fmt.Errorf("process loopback: process %d is not running or has no active "+
+				"WASAPI audio session (apps rendering through the shared audio engine are capturable; "+
+				"legacy winmm/waveOut sounds may not be)", pid)
+		}
 		return nil, hrErr(fmt.Sprintf("process loopback activation for pid %d (GetResult)", pid), h.hr)
 	}
 	if h.result == nil {
@@ -286,8 +316,10 @@ func OpenProcessLoopback(targetPIDs []uint32, exclude bool, format audio.Format,
 	if err := coInitialize(); err != nil {
 		return nil, err
 	}
-	// COM is per-thread; capture goroutines initialize their own apartments.
-	coUninitialize()
+	// ActivateAudioInterfaceAsync requires COM to be initialized on the
+	// CALLING thread; keep it initialized until activation completes. The
+	// capture goroutine initializes its own apartment separately.
+	defer coUninitialize()
 
 	mode := uint32(processLoopbackModeProcessTarget)
 	if exclude {

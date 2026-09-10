@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -813,11 +814,20 @@ func (c *Client) utilityLoop(ctx context.Context) {
 			if m == nil {
 				continue
 			}
-			loss, late, jitterMs, bufMs, _, _, _, _, _, _ := m.snapshot()
+			loss, late, jitterMs, bufMs, seen, lossPk, latePk, reorderPk, concealed, maxBurst := m.snapshot()
 			c.statsMu.Lock()
 			c.stats = clientStats{
-				rttMs: rttMs, loss: loss, late: late,
-				jitterMs: jitterMs, bufMs: bufMs,
+				rttMs:    rttMs,
+				loss:     loss,
+				late:     late,
+				jitterMs: jitterMs,
+				bufMs:    bufMs,
+				seen:     seen,
+				lossPk:   lossPk,
+				latePk:   latePk,
+				reorder:  reorderPk,
+				conceal:  concealed,
+				maxBurst: maxBurst,
 			}
 			c.statsMu.Unlock()
 
@@ -848,6 +858,61 @@ func (c *Client) Stats() clientStats {
 	c.statsMu.Lock()
 	defer c.statsMu.Unlock()
 	return c.stats
+}
+
+// ClientStatsSnapshot is the public, JSON-serializable view of the client's
+// live measurements. It exists so hosts (gomobile/UI layers) can consume the
+// stats without depending on the unexported clientStats type.
+type ClientStatsSnapshot struct {
+	State            string  `json:"state"`
+	Connected        bool    `json:"connected"`
+	RTTMs            float64 `json:"rtt_ms"`
+	LossPct          float64 `json:"loss_pct"`
+	LatePct          float64 `json:"late_pct"`
+	JitterMs         float64 `json:"jitter_ms"`
+	BufferMs         float64 `json:"buffer_ms"`
+	PacketsSeen      uint64  `json:"packets_seen"`
+	LossPackets      uint64  `json:"loss_packets"`
+	LatePackets      uint64  `json:"late_packets"`
+	ReorderedPackets uint64  `json:"reordered_packets"`
+	ConcealedFrames  uint64  `json:"concealed_frames"`
+	FECRecovered     uint64  `json:"fec_recovered"`
+	MaxBurst         int     `json:"max_burst"`
+}
+
+// StatsJSON marshals the latest measurements as a JSON object. It is safe to
+// call on a nil client (returns a disconnected snapshot) and is additive to
+// the existing Stats API; it never mutates client state.
+func (c *Client) StatsJSON() string {
+	snap := ClientStatsSnapshot{State: "idle", Connected: false}
+	if c != nil {
+		st := c.Stats()
+		snap = ClientStatsSnapshot{
+			State:            "connected",
+			Connected:        true,
+			RTTMs:            st.rttMs,
+			LossPct:          st.loss,
+			LatePct:          st.late,
+			JitterMs:         st.jitterMs,
+			BufferMs:         st.bufMs,
+			PacketsSeen:      st.seen,
+			LossPackets:      st.lossPk,
+			LatePackets:      st.latePk,
+			ReorderedPackets: st.reorder,
+			ConcealedFrames:  st.conceal,
+			MaxBurst:         st.maxBurst,
+		}
+		c.mediaM.Lock()
+		if c.media != nil {
+			snap.FECRecovered = c.media.FECRecovered()
+		}
+		c.mediaM.Unlock()
+	}
+	out, err := json.Marshal(snap)
+	if err != nil {
+		return "{}"
+	}
+	return string(out)
 }
 
 // Stop terminates the client (sends STREAM_STOP best-effort via the session

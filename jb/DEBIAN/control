@@ -4,7 +4,8 @@ Architecture: iphoneos-arm
 Maintainer: RemoteAU
 Depends: mobilesubstrate
 Section: Tweaks
-Description: Optional RemoteAU companion for jailbroken devices: Control
- Center toggle, auto-launch, AirPods-aware start/stop, persistence.
+Description: Optional RemoteAU companion for jailbroken devices: a Control
+ Center start/stop toggle that signals the single receiver agent, plus
+ auto-launch/persistence and AirPods-aware start/stop.
 Name: RemoteAU Companion
 Author: RemoteAU
