@@ -106,12 +106,12 @@ final class PCMRing {
     /// converts S16LE→deinterleaved float32 with fractional resampling.
     /// Returns produced frames; -1 when the lock was busy (caller fills
     /// silence and must not retry or wait).
-    func tryDrainAdvanced(into channels: UnsafeMutablePointer<UnsafeMutablePointer<Float32>>?,
+    func tryDrainAdvanced(into channels: UnsafePointer<UnsafeMutablePointer<Float32>>?,
                           channelCount: Int,
                           frameCount: Int,
                           targetFrames: Double,
                           phase: inout Double) -> Int {
-        guard frameCount > 0, channelCount > 0 else { return 0 }
+        guard frameCount > 0, channelCount > 0, let channels else { return 0 }
         guard os_unfair_lock_trylock(&lock) else {
             return -1
         }

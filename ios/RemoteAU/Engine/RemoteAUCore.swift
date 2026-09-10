@@ -1,7 +1,7 @@
 import Foundation
 import SwiftUI
 
-/// Decoded v2 engine statistics (JSON emitted by `RemoteAULatestStats` /
+/// Decoded v2 engine statistics (JSON emitted by `RemoteAUMobileLatestStats` /
 /// the stats sink). All fields default so a blank value always compiles.
 struct V2Stats: Equatable {
     var state: String = ""
@@ -30,7 +30,7 @@ import RemoteAU
 import Security
 
 /// Bridges the Go engine callbacks into Swift.
-final class GoMediaSink: NSObject, RemoteAUMediaSink {
+final class GoMediaSink: NSObject, RemoteAUMobileMediaSink {
     let onPCM: ([UInt8]) -> Void
 
     init(onPCM: @escaping ([UInt8]) -> Void) {
@@ -43,7 +43,7 @@ final class GoMediaSink: NSObject, RemoteAUMediaSink {
     }
 }
 
-final class GoStateSink: NSObject, RemoteAUStateSink {
+final class GoStateSink: NSObject, RemoteAUMobileStateSink {
     let onState: (String) -> Void
 
     init(onState: @escaping (String) -> Void) {
@@ -56,7 +56,7 @@ final class GoStateSink: NSObject, RemoteAUStateSink {
     }
 }
 
-final class GoStatsSink: NSObject, RemoteAUStatsSink {
+final class GoStatsSink: NSObject, RemoteAUMobileStatsSink {
     let onStats: (String) -> Void
 
     init(onStats: @escaping (String) -> Void) {
@@ -71,7 +71,7 @@ final class GoStatsSink: NSObject, RemoteAUStatsSink {
     }
 }
 
-final class GoPINSource: NSObject, RemoteAURequestSource {
+final class GoPINSource: NSObject, RemoteAUMobileRequestSource {
     let get: () -> String
 
     init(get: @escaping () -> String) {
@@ -84,15 +84,14 @@ final class GoPINSource: NSObject, RemoteAURequestSource {
 }
 
 /// Keychain-backed trust storage: implements the Go `StoreSource` interface
-/// (bound as the RemoteAUStoreSource protocol) so the engine keeps its
+/// (bound as the RemoteAUMobileStoreSource protocol) so the engine keeps its
 /// identity key and paired-peer records in the iOS Keychain instead of a
 /// file in the app container.
 ///
 /// Binding shapes assumed (consistent with GoMediaSink/GoPINSource above and
-/// the Error?-returning RemoteAU* calls): Go `[]byte` bridges to `Data?`,
-/// Go `error` bridges to an `Error?` return (gobind protocol methods return
-/// the error rather than throwing), and Go `GetX` becomes `getX`.
-final class KeychainTrust: NSObject, RemoteAUStoreSource {
+/// the throwing RemoteAUMobile* calls): Go `[]byte` bridges to `Data?`, Go
+/// `error` surfaces as a Swift `throws`, and Go `GetX` becomes `getX`.
+final class KeychainTrust: NSObject, RemoteAUMobileStoreSource {
     private static let service = "dev.remoteau.trust"
     private static let identityAccount = "identity"
     private static let peersAccount = "peers"
@@ -111,16 +110,16 @@ final class KeychainTrust: NSObject, RemoteAUStoreSource {
 
     /// Upserts the identity blob. Go always passes a marshalled key; nil is
     /// treated as a no-op.
-    func putIdentity(_ pkcs8: Data?) -> Error? {
-        guard let pkcs8 else { return nil }
-        return KeychainTrust.upsert(account: KeychainTrust.identityAccount, data: pkcs8)
+    func putIdentity(_ pkcs8: Data?) throws {
+        guard let pkcs8 else { return }
+        try KeychainTrust.upsert(account: KeychainTrust.identityAccount, data: pkcs8)
     }
 
     /// Upserts the peers JSON blob (Go always sends a valid JSON array,
     /// including "[]" once the last peer is forgotten).
-    func putPeers(_ json: Data?) -> Error? {
-        guard let json else { return nil }
-        return KeychainTrust.upsert(account: KeychainTrust.peersAccount, data: json)
+    func putPeers(_ json: Data?) throws {
+        guard let json else { return }
+        try KeychainTrust.upsert(account: KeychainTrust.peersAccount, data: json)
     }
 
     /// One-time migration of the legacy file-based trust store
@@ -139,11 +138,11 @@ final class KeychainTrust: NSObject, RemoteAUStoreSource {
         }
         var migrated = true
         if let pkcs8 = state.identity_pkcs8 {
-            migrated = putIdentity(pkcs8) == nil
+            do { try putIdentity(pkcs8) } catch { migrated = false }
         }
         if migrated, let peers = state.peers,
            let blob = try? JSONEncoder().encode(peers) {
-            migrated = putPeers(blob) == nil
+            do { try putPeers(blob) } catch { migrated = false }
         }
         if migrated {
             try? FileManager.default.removeItem(at: legacyURL)
@@ -185,7 +184,7 @@ final class KeychainTrust: NSObject, RemoteAUStoreSource {
         return data
     }
 
-    private static func upsert(account: String, data: Data) -> Error? {
+    private static func upsert(account: String, data: Data) throws {
         let changes: [String: Any] = [
             kSecValueData as String: data,
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
@@ -193,25 +192,28 @@ final class KeychainTrust: NSObject, RemoteAUStoreSource {
         let updateStatus = SecItemUpdate(baseQuery(account: account) as CFDictionary,
                                          changes as CFDictionary)
         if updateStatus == errSecSuccess {
-            return nil
+            return
         }
         if updateStatus != errSecItemNotFound {
-            return statusError(updateStatus)
+            throw statusError(updateStatus)
         }
         var add = baseQuery(account: account)
         add[kSecValueData as String] = data
         add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         let addStatus = SecItemAdd(add as CFDictionary, nil)
         if addStatus == errSecSuccess {
-            return nil
+            return
         }
         if addStatus == errSecDuplicateItem {
             // Raced with another writer; the item now exists, update it.
             let retry = SecItemUpdate(baseQuery(account: account) as CFDictionary,
                                       changes as CFDictionary)
-            return retry == errSecSuccess ? nil : statusError(retry)
+            if retry != errSecSuccess {
+                throw statusError(retry)
+            }
+            return
         }
-        return statusError(addStatus)
+        throw statusError(addStatus)
     }
 
     private static func statusError(_ status: OSStatus) -> NSError {
@@ -240,17 +242,18 @@ final class V2Controller: ObservableObject {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let dir = base.appendingPathComponent("RemoteAU", isDirectory: true).path
         // Move the legacy file-based trust store into the Keychain first;
-        // the Go-side migration inside RemoteAUSetupWithKeychainAndMigrate
+        // the Go-side migration inside RemoteAUMobileSetupWithKeychainAndMigrate
         // only runs while the Keychain is still empty, so the two compose.
         let trust = KeychainTrust()
         trust.migrateLegacyFile(dir: base)
-        let err = RemoteAUSetupWithKeychainAndMigrate(trust, dir)
-        if err != nil {
-            lastError = err.localizedDescription
+        do {
+            _ = try RemoteAUMobileSetupWithKeychainAndMigrate(trust, dir)
+        } catch {
+            lastError = error.localizedDescription
             return
         }
         trustStore = trust
-        RemoteAUSetStateSink(GoStateSink { [weak self] json in
+        RemoteAUMobileSetStateSink(GoStateSink { [weak self] json in
             Task { @MainActor in
                 self?.handleState(json)
             }
@@ -261,8 +264,8 @@ final class V2Controller: ObservableObject {
             }
         }
         statsSink = sinkStats
-        RemoteAUSetStatsSink(sinkStats)
-        pairedPeers = RemoteAUPeerList()
+        RemoteAUMobileSetStatsSink(sinkStats)
+        pairedPeers = RemoteAUMobilePeerList()
     }
 
     struct AdvancedSettings {
@@ -287,22 +290,22 @@ final class V2Controller: ObservableObject {
             self?.deliver(pcm)
         }
         sink = s
-        RemoteAUSetMediaSink(s)
+        RemoteAUMobileSetMediaSink(s)
 
-        var err: Error?
-        if let adv = advanced {
-            err = RemoteAUConnectWithCaps(
-                host, name,
-                Int32(adv.codecOpus ? 1 : 0),
-                48000, 2, Int32(adv.frameMs), Int32(adv.bitrateKbps * 1000),
-                adv.fec, adv.dtx, 5, 0,
-                pinSource
-            )
-        } else {
-            err = RemoteAUConnect(host, name, pinSource)
-        }
-        if let err {
-            lastError = err.localizedDescription
+        do {
+            if let adv = advanced {
+                _ = try RemoteAUMobileConnectWithCaps(
+                    host, name,
+                    adv.codecOpus ? 1 : 0,
+                    48000, 2, adv.frameMs, adv.bitrateKbps * 1000,
+                    adv.fec, adv.dtx, 5, 0,
+                    pinSource
+                )
+            } else {
+                _ = try RemoteAUMobileConnect(host, name, pinSource)
+            }
+        } catch {
+            lastError = error.localizedDescription
         }
     }
 
@@ -320,44 +323,49 @@ final class V2Controller: ObservableObject {
             self?.deliver(pcm)
         }
         sink = s
-        RemoteAUSetMediaSink(s)
+        RemoteAUMobileSetMediaSink(s)
 
         let adv = advanced ?? AdvancedSettings()
-        let err = RemoteAUConnectViaRelay(
-            relayAddr, hostDeviceID, name,
-            Int32(adv.codecOpus ? 1 : 0),
-            48000, 2, Int32(adv.frameMs), Int32(adv.bitrateKbps * 1000),
-            adv.fec, adv.dtx, 5, 0,
-            pinSource
-        )
-        if let err {
-            lastError = err.localizedDescription
+        do {
+            _ = try RemoteAUMobileConnectViaRelay(
+                relayAddr, hostDeviceID, name,
+                adv.codecOpus ? 1 : 0,
+                48000, 2, adv.frameMs, adv.bitrateKbps * 1000,
+                adv.fec, adv.dtx, 5, 0,
+                pinSource
+            )
+        } catch {
+            lastError = error.localizedDescription
         }
     }
 
     func stop() {
-        RemoteAUStop()
+        RemoteAUMobileStop()
     }
 
     /// Windows capture source: kind 0 = system audio, 1 = render device by
     /// name, 2 = diagnostic test tone, 3 = per-app ("p:1,2" / "x:9").
-    /// (Go `int` bridges to Swift `Int32`, matching the other RemoteAU caps.)
+    /// (Go `int` bridges to Swift `Int`, matching the other RemoteAUMobile caps.)
     func setSource(kind: Int, name: String) {
-        if let err = RemoteAUSetSource(Int32(kind), name) {
-            lastError = err.localizedDescription
+        do {
+            _ = try RemoteAUMobileSetSource(kind, name)
+        } catch {
+            lastError = error.localizedDescription
         }
     }
 
     /// Quality mode: 0 auto, 1 lowest, 2 lossless, 3 robust, 4 advanced.
     func setQualityMode(_ mode: Int) {
-        if let err = RemoteAUSetQualityMode(Int32(mode)) {
-            lastError = err.localizedDescription
+        do {
+            _ = try RemoteAUMobileSetQualityMode(mode)
+        } catch {
+            lastError = error.localizedDescription
         }
     }
 
     func forgetPeer(idHex: String) {
-        _ = RemoteAUForgetPeer(idHex)
-        pairedPeers = RemoteAUPeerList()
+        _ = try? RemoteAUMobileForgetPeer(idHex)
+        pairedPeers = RemoteAUMobilePeerList()
     }
 
     /// Paired PCs as decoded records (JSON keys follow the Go struct tags).
@@ -471,9 +479,9 @@ final class V2MediaRouter {
 
 #else
 
-/// Stub mirror of the framework's RemoteAUStatsSink (whose gomobile-imported
-/// string parameter is optional) so the placeholder controller below can
-/// follow the same wiring as the real branch.
+/// Stub mirror of the framework's stats sink (whose gomobile-imported string
+/// parameter is optional) so the placeholder controller below can follow the
+/// same wiring as the real branch.
 protocol StatsSink: AnyObject {
     func onStats(_ json: String?)
 }
@@ -545,14 +553,15 @@ final class V2MediaRouter {
 }
 
 /// No-op mirror of the real KeychainTrust (framework build only): same API
-/// shape so call sites compile unchanged in the v1-only build. The real
-/// class conforms to RemoteAUStoreSource, which does not exist here.
+/// shape so call sites compile unchanged in the v1-only build. The real class
+/// conforms to the framework's store-source protocol, which does not exist
+/// here.
 final class KeychainTrust {
     func migrateLegacyFile(dir: URL) {}
     func getIdentity() -> Data? { nil }
     func getPeers() -> Data? { nil }
-    func putIdentity(_ pkcs8: Data?) -> Error? { nil }
-    func putPeers(_ json: Data?) -> Error? { nil }
+    func putIdentity(_ pkcs8: Data?) throws {}
+    func putPeers(_ json: Data?) throws {}
 }
 
 #endif

@@ -1223,7 +1223,7 @@ enum Profile: String, CaseIterable, Identifiable {
 }
 
 extension QualityPreset {
-    /// Maps to the Go `RemoteAUSetQualityMode` argument.
+    /// Maps to the Go `RemoteAUMobileSetQualityMode` argument.
     var v2Mode: Int {
         switch self {
         case .auto: return 0

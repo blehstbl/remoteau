@@ -252,8 +252,8 @@ final class ReorderBuffer {
                 let p = Int16(bitPattern: UInt16(payload[off + 1]) << 8 | UInt16(payload[off]))
                 let tail = concealTail[f * channels + ch]
                 let mixed = Int16(clamping: Int(Float(p) * payloadGain + Float(tail) * tailGain))
-                out[off] = UInt8(bitPattern: UInt8(mixed & 0xFF))
-                out[off + 1] = UInt8(bitPattern: UInt8((mixed >> 8) & 0xFF))
+                out[off] = UInt8(truncatingIfNeeded: mixed)
+                out[off + 1] = UInt8(truncatingIfNeeded: UInt16(bitPattern: mixed) >> 8)
             }
         }
         return out
@@ -306,8 +306,8 @@ final class ReorderBuffer {
                 for ch in 0..<channels {
                     let v = Int16(clamping: Int(Float(lastSample[ch]) * Float(gain)))
                     let off = (f * channels + ch) * 2
-                    chunk[off] = UInt8(bitPattern: UInt8(v & 0xFF))
-                    chunk[off + 1] = UInt8(bitPattern: UInt8((v >> 8) & 0xFF))
+                    chunk[off] = UInt8(truncatingIfNeeded: v)
+                    chunk[off + 1] = UInt8(truncatingIfNeeded: UInt16(bitPattern: v) >> 8)
                     concealTail.append(v)
                 }
             }

@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import AudioToolbox
 import os
 
 /// Owns AVAudioSession + AVAudioEngine with an AVAudioSourceNode pulling from
@@ -30,7 +31,7 @@ final class AudioEngineController {
 
     /// Milliseconds of buffered audio currently in the ring (for stats).
     var ringDepthMs: Double {
-        ring.queuedFrames / max(1.0, outputSampleRate) * 1000.0
+        Double(ring.queuedFrames) / max(1.0, outputSampleRate) * 1000.0
     }
 
     /// Current drift-correction ratio (for stats display).
@@ -83,12 +84,12 @@ final class AudioEngineController {
                 channels: AVAudioChannelCount(channels)
             )!
 
-            let node = AVAudioSourceNode(format: nodeFormat) { [weak self] silence, _, frames, buffer in
+            let node = AVAudioSourceNode(format: nodeFormat) { [weak self] silence, _, frames, outputData in
                 guard let self else {
                     silence.pointee = true
                     return noErr
                 }
-                return self.render(isSilence: silence, frameCount: Int(frames), buffer: buffer)
+                return self.render(isSilence: silence, frameCount: Int(frames), outputData: outputData)
             }
 
             engine.attach(node)
@@ -121,16 +122,17 @@ final class AudioEngineController {
 
     private func render(isSilence: UnsafeMutablePointer<ObjCBool>,
                         frameCount: Int,
-                        buffer: AVAudioPCMBuffer) -> OSStatus {
-        guard let floatData = buffer.floatChannelData else {
-            isSilence.pointee = true
-            return noErr
-        }
-        let channelCount = Int(buffer.format.channelCount)
-        let outFrames = min(frameCount, Int(buffer.frameLength))
+                        outputData: UnsafeMutablePointer<AudioBufferList>) -> OSStatus {
+        let buffers = UnsafeMutableAudioBufferListPointer(outputData)
+        let channelCount = buffers.count
+        let outFrames = frameCount
         guard outFrames > 0, channelCount > 0 else {
             isSilence.pointee = true
             return noErr
+        }
+
+        var chans: [UnsafeMutablePointer<Float32>] = (0..<channelCount).map { i in
+            buffers[i].mData!.assumingMemoryBound(to: Float32.self)
         }
 
         // Cached target (updated at ~1 Hz by the adaptive policy). Read with
@@ -141,33 +143,34 @@ final class AudioEngineController {
             os_unfair_lock_unlock(&targetLock)
         }
 
-        let produced = ring.tryDrainAdvanced(
-            into: floatData,
-            channelCount: channelCount,
-            frameCount: outFrames,
-            targetFrames: cachedTargetFrames,
-            phase: &phase
-        )
+        let produced = chans.withUnsafeMutableBufferPointer { p in
+            ring.tryDrainAdvanced(
+                into: p.baseAddress,
+                channelCount: channelCount,
+                frameCount: outFrames,
+                targetFrames: cachedTargetFrames,
+                phase: &phase
+            )
+        }
 
         if produced < 0 {
             // Ring lock busy: never wait — silence this callback.
-            fillSilence(floatData, channels: channelCount, frames: outFrames)
+            fillSilence(chans, frames: outFrames)
             isSilence.pointee = true
             return noErr
         }
         if produced < outFrames {
-            fillSilence(floatData, channels: channelCount, frames: outFrames, from: produced)
+            fillSilence(chans, frames: outFrames, from: produced)
         }
         isSilence.pointee = ObjCBool(produced == 0)
         return noErr
     }
 
-    private func fillSilence(_ channels: UnsafeMutablePointer<UnsafeMutablePointer<Float32>>,
-                             channels chCount: Int,
+    private func fillSilence(_ channels: [UnsafeMutablePointer<Float32>],
                              frames: Int,
                              from: Int = 0) {
         guard from < frames else { return }
-        for ch in 0..<chCount {
+        for ch in 0..<channels.count {
             memset(channels[ch] + from, 0, MemoryLayout<Float32>.size * (frames - from))
         }
         if from == 0 {
@@ -262,8 +265,6 @@ final class AudioEngineController {
             // follows the route automatically. Nudge the buffer accounting so
             // the new device starts with audio already flowing.
             ring.noteUnderrun()
-        case .mediaServicesWereReset:
-            handleMediaServicesReset()
         default:
             break
         }
@@ -280,6 +281,6 @@ final class AudioEngineController {
 
     static func currentRouteName() -> String {
         let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
-        return outputs.first?.name ?? "No output"
+        return outputs.first?.portName ?? "No output"
     }
 }
