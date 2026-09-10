@@ -65,6 +65,9 @@ struct V2StatsView: View {
             Text("Secure session (v2)")
                 .font(.footnote.weight(.semibold))
             row("State", stats.state.isEmpty ? "—" : stats.state)
+            if stats.sampleRate > 0 {
+                row("Format", "\(stats.sampleRate) Hz · \(stats.channels) ch")
+            }
             row("Round-trip time", ms(stats.rttMs))
             row("Packet loss", String(format: "%.2f %%", stats.lossPct))
             row("Late", String(format: "%.2f %%", stats.latePct))

@@ -96,6 +96,11 @@ type Client struct {
 	stats        clientStats
 	pairedHostFp string
 
+	// Active stream format (negotiated caps / format updates). Guarded by
+	// statsMu so StatsJSON can read it without racing the receive path.
+	streamSampleRate int
+	streamChannels   int
+
 	stop     chan struct{}
 	stopOnce sync.Once
 }
@@ -119,7 +124,7 @@ func NewClient(opts ClientOptions) (*Client, error) {
 	if opts.Store == nil {
 		return nil, errors.New("engine: client requires a pairing store")
 	}
-	if opts.HostAddr == "" {
+	if opts.HostAddr == "" && opts.RelayAddr == "" {
 		return nil, errors.New("engine: client requires HostAddr")
 	}
 	if opts.Logger == nil {
@@ -399,6 +404,7 @@ func (c *Client) runOnce(ctx context.Context) error {
 		return err
 	}
 	c.setCodec(dec)
+	c.setStreamFormat(int(activeCaps.SampleRate), int(activeCaps.Channels))
 	c.media = newClientMedia(dec, c.opts.OnMedia)
 	defer func() { _ = dec.Close() }()
 	c.setState("streaming")
@@ -479,6 +485,7 @@ func (c *Client) handleControl(m protocolv2.Message) {
 				return
 			}
 			c.setCodec(dec)
+			c.setStreamFormat(int(fu.Caps.SampleRate), int(fu.Caps.Channels))
 			c.mediaM.Lock()
 			c.media = newClientMedia(dec, c.opts.OnMedia)
 			c.mediaM.Unlock()
@@ -786,6 +793,22 @@ func (c *Client) setCodec(dec codec.Codec) {
 	c.codecM.Unlock()
 }
 
+// setStreamFormat records the active audio format (sample rate / channels) so
+// UIs and recorders can read the real negotiated parameters from StatsJSON.
+func (c *Client) setStreamFormat(sampleRate, channels int) {
+	c.statsMu.Lock()
+	c.streamSampleRate = sampleRate
+	c.streamChannels = channels
+	c.statsMu.Unlock()
+}
+
+// streamFormat returns the active audio format (zeros before negotiation).
+func (c *Client) streamFormat() (int, int) {
+	c.statsMu.Lock()
+	defer c.statsMu.Unlock()
+	return c.streamSampleRate, c.streamChannels
+}
+
 // utilityLoop sends real receiver statistics and measures RTT (Phase 10).
 func (c *Client) utilityLoop(ctx context.Context) {
 	ticker := time.NewTicker(time.Second)
@@ -866,6 +889,8 @@ func (c *Client) Stats() clientStats {
 type ClientStatsSnapshot struct {
 	State            string  `json:"state"`
 	Connected        bool    `json:"connected"`
+	SampleRate       int     `json:"sample_rate"`
+	Channels         int     `json:"channels"`
 	RTTMs            float64 `json:"rtt_ms"`
 	LossPct          float64 `json:"loss_pct"`
 	LatePct          float64 `json:"late_pct"`
@@ -887,9 +912,12 @@ func (c *Client) StatsJSON() string {
 	snap := ClientStatsSnapshot{State: "idle", Connected: false}
 	if c != nil {
 		st := c.Stats()
+		sr, ch := c.streamFormat()
 		snap = ClientStatsSnapshot{
 			State:            "connected",
 			Connected:        true,
+			SampleRate:       sr,
+			Channels:         ch,
 			RTTMs:            st.rttMs,
 			LossPct:          st.loss,
 			LatePct:          st.late,

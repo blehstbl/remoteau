@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"testing"
@@ -225,6 +226,21 @@ func TestHostClientLoopback(t *testing.T) {
 	}
 	if string(peers[0].PairingSecret) != string(cpeers[0].PairingSecret) {
 		t.Fatal("pairing secrets differ")
+	}
+
+	// The stats JSON must surface the negotiated stream format so recorders
+	// can use the real v2 parameters instead of hardcoding 48 kHz/stereo.
+	raw := client.StatsJSON()
+	var snap struct {
+		SampleRate int `json:"sample_rate"`
+		Channels   int `json:"channels"`
+	}
+	if err := json.Unmarshal([]byte(raw), &snap); err != nil {
+		t.Fatalf("stats json: %v (%s)", err, raw)
+	}
+	if snap.SampleRate != 48000 || snap.Channels != 2 {
+		t.Fatalf("stats format: sample_rate=%d channels=%d (want 48000/2): %s",
+			snap.SampleRate, snap.Channels, raw)
 	}
 
 	stopClient()

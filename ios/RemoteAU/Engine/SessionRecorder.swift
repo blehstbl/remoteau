@@ -27,6 +27,9 @@ final class SessionRecorder {
     private var file: AVAudioFile?
     private var format: AVAudioFormat?
     private var url: URL?
+    /// Last finalized recording, retained so repeated `stop()` calls are
+    /// idempotent.
+    private var lastURL: URL?
 
     /// Hard cap on buffered-but-unwritten bytes (~4 s of 48 kHz stereo S16).
     private let maxPendingBytes: Int
@@ -103,19 +106,26 @@ final class SessionRecorder {
     }
 
     /// Flushes pending audio and closes the file (AVAudioFile finalizes on
-    /// deinit). Returns the saved URL, or nil when nothing was recording.
+    /// deinit / release). Returns the saved URL. Idempotent: once a recording
+    /// has been finalized, repeated calls keep returning that same URL. After
+    /// this returns, `append(_:)` is a no-op until the next `start(...)`.
     func stop() -> URL? {
         lock.lock()
         let wasActive = recording
         recording = false
+        let activeURL = url
         lock.unlock()
-        guard wasActive else { return nil }
 
-        // Flush remaining chunks; the drain loop exits once pending is empty.
-        ioQueue.sync { [weak self] in self?.drain() }
+        if wasActive {
+            // Flush remaining chunks; the drain loop exits once pending is empty.
+            ioQueue.sync { [weak self] in self?.drain() }
+        }
 
         lock.lock()
-        let saved = url
+        if let activeURL {
+            lastURL = activeURL
+        }
+        let saved = activeURL ?? lastURL
         file = nil          // releases the last reference → closes the WAV
         format = nil
         url = nil

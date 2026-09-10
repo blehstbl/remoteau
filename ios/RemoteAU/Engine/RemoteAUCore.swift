@@ -17,6 +17,9 @@ struct V2Stats: Equatable {
     var reorderedPackets: Double = 0
     var concealedFrames: Double = 0
     var maxBurst: Double = 0
+    /// Stream format reported by the engine (used to size the WAV recorder).
+    var sampleRate: Int = 0
+    var channels: Int = 0
 }
 
 /// Swift bridge to the Go v2 engine (RemoteAU.xcframework via gomobile).
@@ -298,7 +301,36 @@ final class V2Controller: ObservableObject {
         } else {
             err = RemoteAUConnect(host, name, pinSource)
         }
-        if err != nil {
+        if let err {
+            lastError = err.localizedDescription
+        }
+    }
+
+    /// Starts streaming through the secure relay. `relayAddr` is the relay's
+    /// `host:port`; `hostDeviceID` is the 32-hex PC device id the relay
+    /// resolves to the PC's QUIC endpoint. Advanced defaults mirror `connect`.
+    func connectRelay(relayAddr: String, hostDeviceID: String, name: String,
+                      advanced: AdvancedSettings? = nil,
+                      pinPrompt: @escaping () async -> String) {
+        let holder = PINContinuation(prompt: pinPrompt)
+        let pinSource = GoPINSource { [holder] in
+            holder.blockingPin()
+        }
+        let s = GoMediaSink { [weak self] pcm in
+            self?.deliver(pcm)
+        }
+        sink = s
+        RemoteAUSetMediaSink(s)
+
+        let adv = advanced ?? AdvancedSettings()
+        let err = RemoteAUConnectViaRelay(
+            relayAddr, hostDeviceID, name,
+            Int32(adv.codecOpus ? 1 : 0),
+            48000, 2, Int32(adv.frameMs), Int32(adv.bitrateKbps * 1000),
+            adv.fec, adv.dtx, 5, 0,
+            pinSource
+        )
+        if let err {
             lastError = err.localizedDescription
         }
     }
@@ -373,6 +405,8 @@ final class V2Controller: ObservableObject {
             var reordered_packets: Double?
             var concealed_frames: Double?
             var max_burst: Double?
+            var sample_rate: Int?
+            var channels: Int?
         }
         guard let data = json.data(using: .utf8),
               let w = try? JSONDecoder().decode(Wire.self, from: data) else { return }
@@ -390,6 +424,8 @@ final class V2Controller: ObservableObject {
         s.reorderedPackets = w.reordered_packets ?? 0
         s.concealedFrames = w.concealed_frames ?? 0
         s.maxBurst = w.max_burst ?? 0
+        s.sampleRate = w.sample_rate ?? 0
+        s.channels = w.channels ?? 0
         stats = s
     }
 }
@@ -488,6 +524,11 @@ final class V2Controller: ObservableObject {
     }
     func connect(host: String, name: String, advanced: AdvancedSettings? = nil,
                  pinPrompt: @escaping () async -> String) {
+        lastError = "v2 engine framework is not linked into this build"
+    }
+    func connectRelay(relayAddr: String, hostDeviceID: String, name: String,
+                      advanced: AdvancedSettings? = nil,
+                      pinPrompt: @escaping () async -> String) {
         lastError = "v2 engine framework is not linked into this build"
     }
     func stop() {}

@@ -64,6 +64,9 @@ final class ReceiverModel: ObservableObject {
     @Published var discoveredPeers: [DiscoveredPeer] = []
     @Published var finderOn = false
     @Published var recording = false
+    /// URL of the most recently finalized recording (set on manual and
+    /// automatic stops so the UI can surface the saved path).
+    @Published var lastRecordingURL: URL?
 
     // MARK: Engine pieces
     private let ring = PCMRing(capacityBytes: 48_000 * 4 * 2, bytesPerFrame: 4) // ~500 ms @48k stereo
@@ -77,10 +80,18 @@ final class ReceiverModel: ObservableObject {
     /// decide whether to hand PCM to the recorder without touching main
     /// state. The recorder itself drops appends while inactive.
     private let recordingActive = Locked(false)
+    /// Uptime of the last PCM delivered by the v2 (Go) engine. The 1 Hz
+    /// housekeeping pass treats recent external PCM as a live stream, because
+    /// the v2 path never drives the v1 `state` enum.
+    private let lastExternalPCM = Locked(0.0)
     /// Format of the current stream, updated on the main queue by
     /// configureStream(). v2 (no v1 handshake) keeps the 48 kHz/stereo default.
     private var recordSampleRate = 48000
     private var recordChannels = 2
+    /// Optional provider for the active v2 stream format (rate, channels).
+    /// RootView wires this to the V2Controller's latest stats; when unset the
+    /// v1 handshake format (or 48 kHz/stereo) is used.
+    var v2FormatProvider: (() -> (rate: Int, channels: Int))?
 
     // Network threads
     private var audioThread: Thread?
@@ -269,8 +280,11 @@ final class ReceiverModel: ObservableObject {
     /// Feeds externally produced PCM (the Go v2 engine, when linked) into the
     /// same ring/render pipeline. Non-blocking; called from Go callbacks.
     func feedExternalPCM(_ bytes: [UInt8]) {
-        if recordingActive.value, !bytes.isEmpty {
-            recorder.append(bytes)
+        if !bytes.isEmpty {
+            lastExternalPCM.withLock { $0 = ProcessInfo.processInfo.systemUptime }
+            if recordingActive.value {
+                recorder.append(bytes)
+            }
         }
         bytes.withUnsafeBufferPointer { buf in
             if let base = buf.baseAddress {
@@ -296,19 +310,38 @@ final class ReceiverModel: ObservableObject {
     @discardableResult
     func toggleRecording() -> URL? {
         if recording {
-            recordingActive.withLock { $0 = false }
-            let url = recorder.stop()
-            recording = false
-            return url
+            return stopRecording()
+        }
+        // Prefer the live v2 format; fall back to the v1 handshake format
+        // (which itself defaults to 48 kHz/stereo before a stream arrives).
+        var rate = recordSampleRate > 0 ? recordSampleRate : 48000
+        var channels = recordChannels > 0 ? recordChannels : 2
+        if let v2fmt = v2FormatProvider?(), v2fmt.rate > 0 {
+            rate = v2fmt.rate
+            if v2fmt.channels > 0 { channels = v2fmt.channels }
         }
         do {
-            try recorder.start(sampleRate: recordSampleRate, channels: recordChannels)
+            try recorder.start(sampleRate: rate, channels: channels)
             recordingActive.withLock { $0 = true }
             recording = true
         } catch {
             postError("Recording: \(error.localizedDescription)")
         }
         return nil
+    }
+
+    /// Finalizes the active recording (if any) and stores the saved URL so the
+    /// UI surfaces it even when the stop was automatic. Idempotent.
+    @discardableResult
+    private func stopRecording() -> URL? {
+        guard recording else { return nil }
+        recordingActive.withLock { $0 = false }
+        let url = recorder.stop()
+        recording = false
+        if let url {
+            lastRecordingURL = url
+        }
+        return url
     }
 
     func setPreset(_ preset: QualityPreset) {
@@ -636,6 +669,20 @@ final class ReceiverModel: ObservableObject {
 
         DispatchQueue.main.async { [weak self] in
             self?.stats = s
+        }
+
+        // Auto-stop recording once the stream ends so the WAV is finalized
+        // even when the user never toggles it off. Performed on the main
+        // queue because `recording`/`state` are main-queue state. The v2 path
+        // does not drive the v1 state enum, so recent external PCM also
+        // counts as a live stream.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.recording else { return }
+            if case .streaming = self.state { return }
+            let fresh = ProcessInfo.processInfo.systemUptime
+                - self.lastExternalPCM.value < 2.0
+            if fresh { return }
+            self.stopRecording()
         }
     }
 

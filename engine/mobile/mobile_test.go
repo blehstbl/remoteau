@@ -131,6 +131,39 @@ func TestSetSourceAndQualityModeGuards(t *testing.T) {
 	}
 }
 
+func TestConnectViaRelayGuards(t *testing.T) {
+	// Empty relay arguments are rejected before any Setup / guard state.
+	if err := ConnectViaRelay("", "", "iPhone", 0, 0, 0, 0, 0, false, false, 0, 0, nil); err == nil {
+		t.Fatal("ConnectViaRelay accepted empty relay addr and host device id")
+	}
+	if err := ConnectViaRelay("127.0.0.1:1", "", "iPhone", 0, 0, 0, 0, 0, false, false, 0, 0, nil); err == nil {
+		t.Fatal("ConnectViaRelay accepted empty host device id")
+	}
+	if err := ConnectViaRelay("", "00112233445566778899aabbccddeeff", "iPhone", 0, 0, 0, 0, 0, false, false, 0, 0, nil); err == nil {
+		t.Fatal("ConnectViaRelay accepted empty relay addr")
+	}
+
+	// Valid relay arguments but no Setup must return the same "call Setup
+	// first" error as ConnectWithCaps (reset the shared globals so the test
+	// does not depend on package test ordering).
+	Stop()
+	mu.Lock()
+	prevStore, prevIdentity, prevRunning := store, identity, running
+	store, identity, running = nil, nil, false
+	mu.Unlock()
+	defer func() {
+		mu.Lock()
+		store, identity, running = prevStore, prevIdentity, prevRunning
+		mu.Unlock()
+	}()
+
+	err := ConnectViaRelay("127.0.0.1:1", "00112233445566778899aabbccddeeff", "iPhone",
+		0, 0, 0, 0, 0, false, false, 0, 0, nil)
+	if err == nil || err.Error() != "mobile: call Setup first" {
+		t.Fatalf("ConnectViaRelay before Setup: got %v, want call Setup first", err)
+	}
+}
+
 func TestMobileSetupAndStore(t *testing.T) {
 	dir := t.TempDir()
 	if err := Setup(dir); err != nil {

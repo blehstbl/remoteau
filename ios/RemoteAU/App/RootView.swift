@@ -1,6 +1,20 @@
 import SwiftUI
 import UIKit
 
+/// What the pairing sheet connects to: a discovered/manual host, or the
+/// secure relay path (relay `host:port` + 32-hex host device id).
+private enum PairingTarget: Identifiable {
+    case peer(DiscoveredPeer)
+    case relay(addr: String, hostID: String)
+
+    var id: String {
+        switch self {
+        case .peer(let peer): return "peer.\(peer.id)"
+        case .relay(let addr, let hostID): return "relay.\(addr).\(hostID)"
+        }
+    }
+}
+
 /// Main screen: connection hero, discovered PCs, quality presets, live stats
 /// and an expandable statistics view.
 struct RootView: View {
@@ -8,7 +22,7 @@ struct RootView: View {
     @StateObject private var v2 = V2Controller()
     @Environment(\.scenePhase) private var scenePhase
     @State private var showAdvanced = false
-    @State private var pairingPeer: DiscoveredPeer?
+    @State private var pairingTarget: PairingTarget?
 
     // Persisted settings (last-used quality, filters, v2 codec prefs).
     @AppStorage("qualityPreset") private var storedPreset: String = QualityPreset.auto.rawValue
@@ -21,6 +35,9 @@ struct RootView: View {
     @AppStorage("v2DTX") private var v2DTX: Bool = false
     @AppStorage("manualV2Host") private var manualV2Host: String = ""
     @AppStorage("manualV2Port") private var manualV2Port: String = "47010"
+    // Secure relay (WAN) target.
+    @AppStorage("v2RelayAddr") private var v2RelayAddr: String = ""
+    @AppStorage("v2HostDeviceID") private var v2HostDeviceID: String = ""
     // Windows capture source (v2), jitter bounds, named profile.
     @AppStorage("v2SourceKind") private var v2SourceKind: Int = 0
     @AppStorage("v2SourceName") private var v2SourceName: String = ""
@@ -78,13 +95,27 @@ struct RootView: View {
                     .accessibilityLabel("Receiver options")
                 }
             }
-            .sheet(item: $pairingPeer) { peer in
-                PairingSheet(peer: peer, v2: v2,
-                             v2CodecOpus: $v2CodecOpus,
-                             v2FrameMs: $v2FrameMs,
-                             v2BitrateKbps: $v2BitrateKbps,
-                             v2FEC: $v2FEC,
-                             v2DTX: $v2DTX)
+            .sheet(item: $pairingTarget) { target in
+                switch target {
+                case .peer(let peer):
+                    PairingSheet(peer: peer, v2: v2,
+                                 v2CodecOpus: $v2CodecOpus,
+                                 v2FrameMs: $v2FrameMs,
+                                 v2BitrateKbps: $v2BitrateKbps,
+                                 v2FEC: $v2FEC,
+                                 v2DTX: $v2DTX)
+                case .relay(let addr, let hostID):
+                    PairingSheet(peer: DiscoveredPeer(name: "Relay", address: addr,
+                                                      port: 0, protocolVersion: 2,
+                                                      paired: false),
+                                 v2: v2,
+                                 v2CodecOpus: $v2CodecOpus,
+                                 v2FrameMs: $v2FrameMs,
+                                 v2BitrateKbps: $v2BitrateKbps,
+                                 v2FEC: $v2FEC,
+                                 v2DTX: $v2DTX,
+                                 relay: (addr: addr, hostID: hostID))
+                }
             }
             .onAppear {
                 v2.setup()
@@ -111,6 +142,18 @@ struct RootView: View {
                 model.setJitterBounds(minMs: jitterMinMs, maxMs: jitterMaxMs)
                 V2MediaRouter.shared.handler = { pcm in
                     model.feedExternalPCM(pcm)
+                }
+                // Let the recorder pick up the v2 stream's real format.
+                let v2ref = v2
+                model.v2FormatProvider = {
+                    (v2ref.stats.sampleRate, v2ref.stats.channels)
+                }
+            }
+            .onChange(of: model.recording) { isRecording in
+                // Surface the saved path when recording auto-stops because the
+                // stream ended (the toggle binding only covers manual stops).
+                if !isRecording, let url = model.lastRecordingURL {
+                    lastRecordingPath = url.path
                 }
             }
             .onChange(of: v2.state) { newState in
@@ -286,7 +329,7 @@ struct RootView: View {
                 .foregroundStyle(.secondary)
 
             if remoteMode {
-                Text("Remote / Efficient tunes codec and buffering for relay-friendly streaming; relay connection setup is not available in this build.")
+                Text("Remote / Efficient tunes codec and buffering for relay-friendly streaming. To use a relay, enter its address and the PC's host device ID under Connect manually.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
@@ -338,7 +381,7 @@ struct RootView: View {
             Text("Quality")
                 .font(.headline)
             Picker("Quality preset", selection: $model.qualityPreset) {
-                ForEach(QualityPreset.allCases.filter { $0 != .advanced }) { preset in
+                ForEach(QualityPreset.allCases) { preset in
                     Text(preset.rawValue).tag(preset)
                 }
             }
@@ -360,20 +403,18 @@ struct RootView: View {
             Toggle("Advanced controls", isOn: $showAdvanced)
                 .font(.subheadline)
 
-            if showAdvanced {
-                if model.qualityPreset == .advanced {
-                    HStack {
-                        Slider(value: $model.manualTargetMs, in: 8...200, step: 1) {
-                            Text("Buffer target")
-                        }
-                        Text("\(Int(model.manualTargetMs)) ms")
-                            .monospacedDigit()
-                            .frame(width: 64, alignment: .trailing)
+            if showAdvanced || model.qualityPreset == .advanced {
+                HStack {
+                    Slider(value: $model.manualTargetMs, in: 8...200, step: 1) {
+                        Text("Buffer target")
                     }
-                    .onChange(of: model.manualTargetMs) { v in
-                        model.setManualTarget(ms: v)
-                        storedTargetMs = v
-                    }
+                    Text("\(Int(model.manualTargetMs)) ms")
+                        .monospacedDigit()
+                        .frame(width: 64, alignment: .trailing)
+                }
+                .onChange(of: model.manualTargetMs) { v in
+                    model.setManualTarget(ms: v)
+                    storedTargetMs = v
                 }
 
                 // v2 codec preferences (used when connecting through the v2
@@ -592,7 +633,7 @@ struct RootView: View {
             } else {
                 ForEach(sortedPeers) { peer in
                     Button {
-                        pairingPeer = peer
+                        pairingTarget = .peer(peer)
                     } label: {
                         DeviceCard(peer: peer)
                     }
@@ -647,6 +688,33 @@ struct RootView: View {
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
+
+            Divider()
+                .padding(.vertical, 2)
+
+            Text("Relay (WAN)")
+                .font(.subheadline.weight(.semibold))
+            TextField("Relay address (host:port)", text: $v2RelayAddr)
+                .textFieldStyle(.roundedBorder)
+                .keyboardType(.numbersAndPunctuation)
+                .autocorrectionDisabled()
+                .textInputAutocapitalization(.never)
+            TextField("Host device ID (32 hex chars)", text: $v2HostDeviceID)
+                .textFieldStyle(.roundedBorder)
+                .keyboardType(.asciiCapable)
+                .autocorrectionDisabled()
+                .textInputAutocapitalization(.never)
+            Button {
+                openRelayPairing()
+            } label: {
+                Text("Connect via relay")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .disabled(!relayConnectReady)
+            Text("For PCs reachable only through `remote-au relay`. Scan the PC's QR code to fill the host device ID.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
         }
         .padding(Theme.spacingL)
         .background(.background.secondary, in: RoundedRectangle(cornerRadius: Theme.cornerL))
@@ -663,8 +731,29 @@ struct RootView: View {
             return
         }
         manualError = nil
-        pairingPeer = DiscoveredPeer(name: host, address: host, port: port,
-                                     protocolVersion: 2, paired: false)
+        pairingTarget = .peer(DiscoveredPeer(name: host, address: host, port: port,
+                                             protocolVersion: 2, paired: false))
+    }
+
+    /// True when the relay address is non-empty and the device id is 32 hex.
+    private var relayConnectReady: Bool {
+        !v2RelayAddr.trimmingCharacters(in: .whitespaces).isEmpty && hostDeviceIDIsValid
+    }
+
+    private var hostDeviceIDIsValid: Bool {
+        let s = v2HostDeviceID.trimmingCharacters(in: .whitespaces).lowercased()
+        return s.count == 32 && s.allSatisfy { $0.isHexDigit }
+    }
+
+    private func openRelayPairing() {
+        let addr = v2RelayAddr.trimmingCharacters(in: .whitespaces)
+        let hostID = v2HostDeviceID.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !addr.isEmpty, hostDeviceIDIsValid else {
+            manualError = "Enter a relay address and a 32-character hex host device ID."
+            return
+        }
+        manualError = nil
+        pairingTarget = .relay(addr: addr, hostID: hostID)
     }
 
     // MARK: Legacy v1 filter
@@ -766,6 +855,9 @@ struct RootView: View {
 
 struct PairingSheet: View {
     var peer: DiscoveredPeer
+    /// Non-nil when connecting through the secure relay; `hostID` may be
+    /// overridden by a scanned QR link that carries an `id`.
+    var relay: (addr: String, hostID: String)?
     @ObservedObject var v2: V2Controller
     @Binding var v2CodecOpus: Bool
     @Binding var v2FrameMs: Int
@@ -773,6 +865,8 @@ struct PairingSheet: View {
     @Binding var v2FEC: Bool
     @Binding var v2DTX: Bool
     @Environment(\.dismiss) private var dismiss
+    // Shared with RootView so scanning the PC's QR prefills the host id.
+    @AppStorage("v2HostDeviceID") private var storedHostDeviceID: String = ""
     @State private var pin = ""
     @State private var connecting = false
     @State private var showScanner = false
@@ -789,8 +883,10 @@ struct PairingSheet: View {
          v2BitrateKbps: Binding<Int>,
          v2FEC: Binding<Bool>,
          v2DTX: Binding<Bool>,
-         preScanned: PairingLink? = nil) {
+         preScanned: PairingLink? = nil,
+         relay: (addr: String, hostID: String)? = nil) {
         self.peer = peer
+        self.relay = relay
         self._v2 = ObservedObject(wrappedValue: v2)
         self._v2CodecOpus = v2CodecOpus
         self._v2FrameMs = v2FrameMs
@@ -807,7 +903,7 @@ struct PairingSheet: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(peer.name)
                         .font(.title3.weight(.semibold))
-                    Text("\(targetHost) · protocol v\(peer.protocolVersion)")
+                    Text(subtitle)
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
@@ -935,6 +1031,11 @@ struct PairingSheet: View {
         linkError = nil
         scannedLink = link
         pin = link.code
+        // A QR that carries a device id is usable as the relay host id too,
+        // so mirror it into the shared field the manual card reads.
+        if let id = link.id {
+            storedHostDeviceID = id
+        }
         UIAccessibility.post(notification: .announcement,
                              argument: "Pairing code scanned. Connecting.")
         connect()
@@ -951,11 +1052,30 @@ struct PairingSheet: View {
         )
         // `pinPrompt` is `() async -> String`; the code (typed or scanned)
         // is already seeded into `pin`, so this resolves immediately.
-        v2.connect(host: targetHost,
-                   name: Self.deviceName(),
-                   advanced: adv) {
-            return pin
+        if let relay {
+            // Prefer a scanned id (it is the authoritative peer id) over the
+            // manually typed one, then connect through the relay.
+            let hostID = scannedLink?.id ?? relay.hostID
+            v2.connectRelay(relayAddr: relay.addr,
+                            hostDeviceID: hostID,
+                            name: Self.deviceName(),
+                            advanced: adv) {
+                return pin
+            }
+        } else {
+            v2.connect(host: targetHost,
+                       name: Self.deviceName(),
+                       advanced: adv) {
+                return pin
+            }
         }
+    }
+
+    private var subtitle: String {
+        if let relay {
+            return "\(relay.addr) · secure relay"
+        }
+        return "\(targetHost) · protocol v\(peer.protocolVersion)"
     }
 
     private var targetHost: String {

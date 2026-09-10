@@ -233,6 +233,29 @@ func Connect(hostAddr, deviceName string, pins RequestSource) error {
 // codec: 0=PCM 1=Opus). The reconnect loop is always enabled.
 func ConnectWithCaps(hostAddr, deviceName string, codecID, rate, channels, frameMs, bitrate int,
 	fec, dtx bool, complexity, appID int, pins RequestSource) error {
+	return connectClient(hostAddr, "", "", deviceName, codecID, rate, channels, frameMs,
+		bitrate, fec, dtx, complexity, appID, pins)
+}
+
+// ConnectViaRelay starts the client through a relay splice instead of a direct
+// LAN connection. The host is identified by hostDeviceID (hex, 32 chars) and
+// all payloads are sealed with the pairing secret from a prior LAN pairing.
+// Semantics (reconnect loop, guards, stats) match ConnectWithCaps.
+func ConnectViaRelay(relayAddr, hostDeviceID, deviceName string, codecID, rate, channels, frameMs, bitrate int,
+	fec, dtx bool, complexity, appID int, pins RequestSource) error {
+	if relayAddr == "" || hostDeviceID == "" {
+		return errors.New("mobile: relay address and host device id required")
+	}
+	return connectClient("", relayAddr, hostDeviceID, deviceName, codecID, rate, channels, frameMs,
+		bitrate, fec, dtx, complexity, appID, pins)
+}
+
+// connectClient is the shared connect path behind ConnectWithCaps (direct) and
+// ConnectViaRelay. Exactly one of hostAddr or relayAddr is non-empty; callers
+// validate their mode-specific arguments beforehand.
+func connectClient(hostAddr, relayAddr, hostDeviceID, deviceName string,
+	codecID, rate, channels, frameMs, bitrate int,
+	fec, dtx bool, complexity, appID int, pins RequestSource) error {
 	mu.Lock()
 	if running {
 		mu.Unlock()
@@ -242,7 +265,7 @@ func ConnectWithCaps(hostAddr, deviceName string, codecID, rate, channels, frame
 		mu.Unlock()
 		return errors.New("mobile: call Setup first")
 	}
-	if hostAddr == "" {
+	if relayAddr == "" && hostAddr == "" {
 		mu.Unlock()
 		return errors.New("mobile: host address required")
 	}
@@ -301,9 +324,11 @@ func ConnectWithCaps(hostAddr, deviceName string, codecID, rate, channels, frame
 		}()
 
 		c, err := engine.NewClient(engine.ClientOptions{
-			HostAddr: hostAddr,
-			Name:     deviceName,
-			Store:    storeRef,
+			HostAddr:     hostAddr,
+			RelayAddr:    relayAddr,
+			HostDeviceID: hostDeviceID,
+			Name:         deviceName,
+			Store:        storeRef,
 			PINProvider: func() (string, error) {
 				if pins == nil {
 					return "", errors.New("no pin source")
