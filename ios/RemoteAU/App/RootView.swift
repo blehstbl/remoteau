@@ -247,7 +247,7 @@ struct RootView: View {
             }
         }
         .padding(Theme.spacingL)
-        .background(.background.secondary, in: RoundedRectangle(cornerRadius: Theme.cornerL))
+        .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: Theme.cornerL))
         .accessibilityElement(children: .contain)
     }
 
@@ -335,7 +335,7 @@ struct RootView: View {
             }
         }
         .padding(Theme.spacingL)
-        .background(.background.secondary, in: RoundedRectangle(cornerRadius: Theme.cornerL))
+        .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: Theme.cornerL))
     }
 
     private var selectedProfile: Profile {
@@ -433,7 +433,7 @@ struct RootView: View {
                         .pickerStyle(.segmented)
                         HStack {
                             Slider(value: .init(get: { Double(v2BitrateKbps) },
-                                                set: { v2BitrateKbps = Int(v) }),
+                                                set: { v in v2BitrateKbps = Int(v) }),
                                    in: 16...256, step: 8) {
                                 Text("Bitrate")
                             }
@@ -455,7 +455,7 @@ struct RootView: View {
             }
         }
         .padding(Theme.spacingL)
-        .background(.background.secondary, in: RoundedRectangle(cornerRadius: Theme.cornerL))
+        .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: Theme.cornerL))
     }
 
     // MARK: Capture source (Windows, v2)
@@ -643,7 +643,7 @@ struct RootView: View {
             }
         }
         .padding(Theme.spacingL)
-        .background(.background.secondary, in: RoundedRectangle(cornerRadius: Theme.cornerL))
+        .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: Theme.cornerL))
     }
 
     /// Secure v2 peers first, then by name.
@@ -717,7 +717,7 @@ struct RootView: View {
                 .foregroundStyle(.secondary)
         }
         .padding(Theme.spacingL)
-        .background(.background.secondary, in: RoundedRectangle(cornerRadius: Theme.cornerL))
+        .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: Theme.cornerL))
     }
 
     private func connectManual() {
@@ -774,7 +774,7 @@ struct RootView: View {
                 .foregroundStyle(.secondary)
         }
         .padding(Theme.spacingL)
-        .background(.background.secondary, in: RoundedRectangle(cornerRadius: Theme.cornerL))
+        .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: Theme.cornerL))
     }
 
     // MARK: Paired PCs (v2 trust store)
@@ -803,7 +803,7 @@ struct RootView: View {
                 }
             }
             .padding(Theme.spacingL)
-            .background(.background.secondary, in: RoundedRectangle(cornerRadius: Theme.cornerL))
+            .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: Theme.cornerL))
         }
     }
 
@@ -825,7 +825,7 @@ struct RootView: View {
             }
         }
         .padding(Theme.spacingL)
-        .background(.background.secondary, in: RoundedRectangle(cornerRadius: Theme.cornerL))
+        .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: Theme.cornerL))
         .accessibilityHint("Detailed network and buffer statistics")
     }
 
@@ -837,7 +837,7 @@ struct RootView: View {
                     .foregroundStyle(.orange)
                     .padding(Theme.spacingM)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(.background.secondary, in: RoundedRectangle(cornerRadius: Theme.cornerM))
+                    .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: Theme.cornerM))
             }
             if !v2.lastError.isEmpty {
                 Label(v2.lastError, systemImage: "exclamationmark.triangle.fill")
@@ -845,7 +845,7 @@ struct RootView: View {
                     .foregroundStyle(.orange)
                     .padding(Theme.spacingM)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(.background.secondary, in: RoundedRectangle(cornerRadius: Theme.cornerM))
+                    .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: Theme.cornerM))
             }
         }
     }

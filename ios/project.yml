@@ -45,6 +45,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.remoteau.app
+        PRODUCT_MODULE_NAME: RemoteAUApp
         INFOPLIST_KEY_UIBackgroundModes: audio
 schemes:
   RemoteAU:
