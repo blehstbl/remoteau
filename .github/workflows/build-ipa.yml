@@ -81,30 +81,20 @@ jobs:
           gomobile init
           mkdir -p "$GITHUB_WORKSPACE/ios/Frameworks" "$GITHUB_WORKSPACE/build"
 
-          # Device slice: cgo flags point at the device libopus.
+          # Device slice only: an installable IPA does not need a simulator
+          # slice, and skipping the manual merge keeps this robust.
           PKG_CONFIG_PATH="$GITHUB_WORKSPACE/opus-ios/device/lib/pkgconfig" \
           CGO_CFLAGS="-I$GITHUB_WORKSPACE/opus-ios/device/include/opus" \
           CGO_LDFLAGS="-L$GITHUB_WORKSPACE/opus-ios/device/lib -lopus" \
           gomobile bind -v -target ios \
-            -o "$GITHUB_WORKSPACE/build/RemoteAU-ios.xcframework" -prefix RemoteAU \
+            -o "$GITHUB_WORKSPACE/build/RemoteAU.xcframework" -prefix RemoteAU \
             -tags "opus,nolibopusfile" remote-au/mobile
 
-          # Simulator slice: cgo flags point at the merged simulator libopus.
-          PKG_CONFIG_PATH="$GITHUB_WORKSPACE/opus-ios/sim/lib/pkgconfig" \
-          CGO_CFLAGS="-I$GITHUB_WORKSPACE/opus-ios/sim/include/opus" \
-          CGO_LDFLAGS="-L$GITHUB_WORKSPACE/opus-ios/sim/lib -lopus" \
-          gomobile bind -v -target iossimulator \
-            -o "$GITHUB_WORKSPACE/build/RemoteAU-sim.xcframework" -prefix RemoteAU \
-            -tags "opus,nolibopusfile" remote-au/mobile
-
-          # Combine into one xcframework (proper Info.plist written by Xcode).
           cd "$GITHUB_WORKSPACE"
-          DEV_FW=$(find build/RemoteAU-ios.xcframework -maxdepth 2 -name RemoteAU.framework)
-          SIM_FW=$(find build/RemoteAU-sim.xcframework -maxdepth 2 -name RemoteAU.framework)
           rm -rf ios/Frameworks/RemoteAU.xcframework
-          xcodebuild -create-xcframework \
-            -framework "$DEV_FW" -framework "$SIM_FW" \
-            -output ios/Frameworks/RemoteAU.xcframework
+          mkdir -p ios/Frameworks
+          cp -R build/RemoteAU.xcframework ios/Frameworks/RemoteAU.xcframework
+          test -d ios/Frameworks/RemoteAU.xcframework/ios-arm64/RemoteAU.framework
 
       - name: Upload framework
         uses: actions/upload-artifact@v4
