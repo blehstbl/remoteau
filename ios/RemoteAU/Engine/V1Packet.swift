@@ -9,7 +9,7 @@ enum V1Packet {
     static let maxDatagramBytes = 1500
     static let maxAudioPayloadBytes = 960
 
-    enum Type: UInt8 {
+    enum DatagramType: UInt8 {
         case hello = 1
         case audio = 2
     }
@@ -48,7 +48,7 @@ enum V1Packet {
         guard packet[0] == magic[0], packet[1] == magic[1],
               packet[2] == magic[2], packet[3] == magic[3] else { return nil }
         guard packet[4] == version else { return nil }
-        guard let type = Type(rawValue: packet[5]) else { return nil }
+        guard let type = DatagramType(rawValue: packet[5]) else { return nil }
         let body = packet[6...]
 
         switch type {
@@ -176,7 +176,7 @@ enum V1Packet {
             guard tcpPort == 0 else { return nil }
             let name = String(data: Data(packet[headerLen..<(headerLen + nameLen)]), encoding: .utf8) ?? ""
             return (type, name, Announce(tcpPort: 0, instanceID: [], advertised: [], name: "", protoVersion: 0))
-        case .announce:
+        case .announce, .announceV2:
             // Announce body: instance(16) + advertised(4) + name.
             let fixed = 16 + 4
             let wantLen = headerLen + fixed + nameLen

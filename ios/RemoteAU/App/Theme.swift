@@ -22,9 +22,9 @@ enum Theme {
 
     static func qualityLabel(for loss: Double, jitter: Double) -> String {
         switch (loss, jitter) {
-        case (<1, <6): return "Excellent"
-        case (<3, <15): return "Good"
-        case (<6, <40): return "Fair"
+        case (0..<1, 0..<6): return "Excellent"
+        case (0..<3, 0..<15): return "Good"
+        case (0..<6, 0..<40): return "Fair"
         default: return "Poor"
         }
     }
