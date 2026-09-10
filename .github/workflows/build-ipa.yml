@@ -112,7 +112,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: RemoteAU-xcframework
-          path: ios/Frameworks
+          path: ios/Frameworks/RemoteAU.xcframework
 
       - name: Enable v2 in project
         run: python3 scripts/add-v2-dep.py
