@@ -342,18 +342,44 @@ final class V2MediaRouter {
 #else
 
 /// Placeholder when the Go framework is not linked (v1-only build).
+/// NOTE: release builds always link RemoteAU.xcframework (v2 + Opus), so this
+/// branch exists only to keep source-level consistency; it mirrors the real
+/// V2Controller surface used by the UI.
 @MainActor
 final class V2Controller: ObservableObject {
     @Published var state = "unavailable"
     @Published var lastError = ""
     @Published var pairedPeers = "[]"
 
+    struct AdvancedSettings {
+        var codecOpus: Bool = false
+        var frameMs: Int = 5
+        var bitrateKbps: Int = 128
+        var fec: Bool = false
+        var dtx: Bool = false
+    }
+
+    struct PairedPC: Identifiable {
+        var id: String
+        var name: String
+    }
+
+    var peers: [PairedPC] { [] }
+
     func setup() {}
-    func connect(host: String, name: String, pinPrompt: @escaping () async -> String) {
+    func connect(host: String, name: String, advanced: AdvancedSettings? = nil,
+                 pinPrompt: @escaping () async -> String) {
         lastError = "v2 engine framework is not linked into this build"
     }
     func stop() {}
     func forgetPeer(idHex: String) {}
+}
+
+/// Placeholder media router (real one exists in the framework build).
+final class V2MediaRouter {
+    static let shared = V2MediaRouter()
+    var handler: (([UInt8]) -> Void)?
+    func push(_ pcm: [UInt8]) { handler?(pcm) }
 }
 
 /// No-op mirror of the real KeychainTrust (framework build only): same API
