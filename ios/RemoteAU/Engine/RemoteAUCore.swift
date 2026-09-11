@@ -342,15 +342,17 @@ final class V2Controller: ObservableObject {
     /// name, 2 = diagnostic test tone, 3 = per-app ("p:1,2" / "x:9").
     /// (Go `int` bridges to Swift `Int`, matching the other RemoteAUMobile caps.)
     func setSource(kind: Int, name: String) {
-        if !RemoteAUMobileSetSource(kind, name, nil) {
-            lastError = "setting the capture source failed"
+        var err: NSError?
+        if !RemoteAUMobileSetSource(kind, name, &err) {
+            lastError = "setting the capture source failed: \(err?.localizedDescription ?? "unknown error")"
         }
     }
 
     /// Quality mode: 0 auto, 1 lowest, 2 lossless, 3 robust, 4 advanced.
     func setQualityMode(_ mode: Int) {
-        if !RemoteAUMobileSetQualityMode(mode, nil) {
-            lastError = "setting the quality mode failed"
+        var err: NSError?
+        if !RemoteAUMobileSetQualityMode(mode, &err) {
+            lastError = "setting the quality mode failed: \(err?.localizedDescription ?? "unknown error")"
         }
     }
 

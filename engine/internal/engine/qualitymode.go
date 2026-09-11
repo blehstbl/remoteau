@@ -79,6 +79,11 @@ func (h *Host) applySetSource(src protocolv2.SetSource) (bool, string) {
 		if err := h.SetCaptureSource(audio.SourceLoopback); err != nil {
 			return false, err.Error()
 		}
+		// SetSourceDevice/SetCaptureSource close the shared capture; reopen it
+		// so the running stream keeps producing audio after the switch.
+		if err := h.ensureCapture(); err != nil {
+			return false, err.Error()
+		}
 		return true, "source: system default"
 
 	case protocolv2.SetSourceDevice:
@@ -101,6 +106,9 @@ func (h *Host) applySetSource(src protocolv2.SetSource) (bool, string) {
 		if err := h.SetCaptureSource(audio.SourceLoopback); err != nil {
 			return false, err.Error()
 		}
+		if err := h.ensureCapture(); err != nil {
+			return false, err.Error()
+		}
 		return true, "source: " + dev.Name
 
 	case protocolv2.SetSourceTestTone:
@@ -109,6 +117,9 @@ func (h *Host) applySetSource(src protocolv2.SetSource) (bool, string) {
 		h.opts.ToneMode = audio.ToneSine
 		h.mu.Unlock()
 		if err := h.SetCaptureSource(audio.SourceTestTone); err != nil {
+			return false, err.Error()
+		}
+		if err := h.ensureCapture(); err != nil {
 			return false, err.Error()
 		}
 		return true, "source: synthetic test tone"

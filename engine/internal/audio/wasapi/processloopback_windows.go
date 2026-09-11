@@ -503,3 +503,9 @@ func clampI32ToS16(v int32) uint16 {
 		return uint16(int16(v))
 	}
 }
+
+// OpenProcessLoopback lets *Backend satisfy the engine's optional
+// processLoopbackBackend interface so per-app capture can be injected in tests.
+func (b *Backend) OpenProcessLoopback(targetPIDs []uint32, exclude bool, format audio.Format, logger logging.Logger) (audio.Capture, error) {
+	return OpenProcessLoopback(targetPIDs, exclude, format, logger)
+}

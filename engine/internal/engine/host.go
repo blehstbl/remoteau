@@ -1271,6 +1271,12 @@ func (h *Host) sendLoop(st *hostStream, caps protocolv2.Caps, startSeq uint32) {
 
 		n := h.readCapture(buf[:])
 		if n == 0 {
+			// The shared capture is closed by any runtime source switch. Reopen
+			// it here so a live stream never goes permanently silent while
+			// h.capture is nil (ensureCapture is a cheap no-op when open).
+			if err := h.ensureCapture(); err != nil {
+				h.log.Debugf("reopen capture: %v", err)
+			}
 			time.Sleep(2 * time.Millisecond)
 			continue
 		}
@@ -1592,6 +1598,16 @@ func (h *Host) applySetSourceWithApps(src protocolv2.SetSource) (bool, string) {
 		if err := h.SetCaptureApps(pids, exclude); err != nil {
 			return false, err.Error()
 		}
+		// SetCaptureApps closes the shared capture; reopen it. If per-app
+		// activation fails, restore the system default so the running stream
+		// keeps producing audio instead of going silent.
+		if err := h.ensureCapture(); err != nil {
+			_ = h.SetCaptureSource(audio.SourceLoopback)
+			if rerr := h.ensureCapture(); rerr != nil {
+				h.log.Warnf("restore default capture after per-app failure: %v", rerr)
+			}
+			return false, err.Error()
+		}
 		if exclude {
 			return true, fmt.Sprintf("source: all apps except pid %v", pids)
 		}
@@ -1639,6 +1655,13 @@ func openCapture(source audio.Source, selector string, format audio.Format, logg
 	return nil, errors.New("engine: host requires a backend (Backend option)")
 }
 
+// processLoopbackBackend is implemented by audio backends that support
+// per-application capture (WASAPI process loopback on Windows). Host uses it
+// when available so the per-app path can be exercised by test backends.
+type processLoopbackBackend interface {
+	OpenProcessLoopback(pids []uint32, exclude bool, format audio.Format, logger logging.Logger) (audio.Capture, error)
+}
+
 // ensureCapture opens the shared capture stream once (via the backend).
 func (h *Host) ensureCaptureViaBackend() error {
 	h.mu.Lock()
@@ -1656,7 +1679,19 @@ func (h *Host) ensureCaptureViaBackend() error {
 			pids = h.opts.ExcludeApps
 			exclude = true
 		}
-		cap, err := wasapi.OpenProcessLoopback(pids, exclude, h.opts.Format, h.log)
+		// Prefer a backend that can capture a specific process (the WASAPI
+		// backend does); otherwise fall back to the package function, which is
+		// the real Windows implementation. The seam keeps this path testable
+		// without COM.
+		var (
+			cap audio.Capture
+			err error
+		)
+		if pb, ok := h.opts.Backend.(processLoopbackBackend); ok {
+			cap, err = pb.OpenProcessLoopback(pids, exclude, h.opts.Format, h.log)
+		} else {
+			cap, err = wasapi.OpenProcessLoopback(pids, exclude, h.opts.Format, h.log)
+		}
 		if err != nil {
 			return fmt.Errorf("open process loopback: %w", err)
 		}

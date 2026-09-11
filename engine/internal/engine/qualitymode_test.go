@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"remote-au/internal/audio"
+	"remote-au/internal/logging"
 	"remote-au/internal/protocol/v2"
 )
 
@@ -25,6 +26,9 @@ func (b *listingBackend) EnumerateDevices() (audio.DeviceLists, error) {
 }
 func (b *listingBackend) OpenCapture(opts audio.CaptureOptions) (audio.Capture, error) {
 	return &fakeCapture{format: opts.Format}, nil
+}
+func (b *listingBackend) OpenProcessLoopback(pids []uint32, exclude bool, format audio.Format, logger logging.Logger) (audio.Capture, error) {
+	return &fakeCapture{format: format}, nil
 }
 func (b *listingBackend) OpenPlayback(audio.PlaybackOptions) (audio.Playback, error) {
 	return nil, audio.ErrNoBackend
